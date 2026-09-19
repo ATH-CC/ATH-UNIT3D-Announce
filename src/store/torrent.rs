@@ -1,48 +1,38 @@
 use std::net::IpAddr;
 use std::ops::{Deref, DerefMut};
-use std::str::FromStr;
-use std::sync::Arc;
 
-use axum::extract::{Json, Path, State};
-use axum::http::StatusCode;
 use futures_util::TryStreamExt;
 use indexmap::IndexMap;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sqlx::MySqlPool;
 use sqlx::types::chrono::{DateTime, Utc};
-use tracing::info;
 
 use anyhow::{Context, Result};
 
-pub mod infohash;
-pub use infohash::InfoHash;
+use crate::model::{peer_id::PeerId, torrent_status::TorrentStatus};
+use crate::store::peer::{Index, Peer, PeerStore};
 
-pub mod infohash2id;
+pub struct TorrentStore {
+    inner: IndexMap<u32, Torrent>,
+}
 
-pub mod status;
-pub use status::Status;
-
-use crate::tracker::peer::{self, Index};
-use crate::tracker::{Peer, Tracker};
-use peer::peer_id::PeerId;
-
-pub struct Map(IndexMap<u32, Torrent>);
-
-impl Map {
-    pub fn new() -> Map {
-        Map(IndexMap::new())
+impl TorrentStore {
+    pub fn new() -> TorrentStore {
+        TorrentStore {
+            inner: IndexMap::new(),
+        }
     }
 
-    pub async fn from_db(db: &MySqlPool) -> Result<Map> {
+    pub async fn from_db(db: &MySqlPool) -> Result<TorrentStore> {
         // Load one torrent per info hash. If multiple are found, prefer
         // undeleted torrents. If multiple are still found, prefer approved
         // torrents. If multiple are still found, prefer the oldest.
-        let mut torrents = sqlx::query_as!(
+        let torrents = sqlx::query_as!(
             DBImportTorrent,
             r#"
                 SELECT
                     torrents.id as `id: u32`,
-                    torrents.status as `status: Status`,
+                    torrents.status as `status: TorrentStatus`,
                     torrents.seeders as `seeders: u32`,
                     torrents.leechers as `leechers: u32`,
                     torrents.times_completed as `times_completed: u32`,
@@ -66,16 +56,9 @@ impl Map {
                     ON distinct_torrents.id = torrents.id
             "#
         )
-        .fetch(db);
-
-        let mut torrent_map = Map::new();
-
-        while let Some(torrent) = torrents
-            .try_next()
-            .await
-            .context("Failed loading torrents.")?
-        {
-            torrent_map.insert(
+        .fetch(db)
+        .try_fold(TorrentStore::new(), |mut store, torrent| async move {
+            store.insert(
                 torrent.id,
                 Torrent {
                     id: torrent.id,
@@ -86,13 +69,17 @@ impl Map {
                     download_factor: torrent.download_factor,
                     upload_factor: torrent.upload_factor,
                     is_deleted: torrent.is_deleted,
-                    peers: peer::Map::new(),
+                    peers: PeerStore::new(),
                 },
             );
-        }
+
+            Ok(store)
+        })
+        .await
+        .context("Failed loading torrents.")?;
 
         // Load peers into each torrent
-        let mut peers = sqlx::query!(
+        sqlx::query!(
             r#"
                 SELECT
                     INET6_NTOA(peers.ip) as `ip_address: IpAddr`,
@@ -111,10 +98,9 @@ impl Map {
                     peers
             "#
         )
-        .fetch(db);
-
-        while let Some(peer) = peers.try_next().await.expect("Failed loading peers.") {
-            torrent_map.entry(peer.torrent_id).and_modify(|torrent| {
+        .fetch(db)
+        .try_fold(torrents, |mut store, peer| async move {
+            store.entry(peer.torrent_id).and_modify(|torrent| {
                 torrent.peers.insert(
                     Index {
                         user_id: peer.user_id,
@@ -138,90 +124,32 @@ impl Map {
                     },
                 );
             });
-        }
 
-        Ok(torrent_map)
-    }
-
-    pub async fn upsert(
-        State(tracker): State<Arc<Tracker>>,
-        Json(torrent): Json<APIInsertTorrent>,
-    ) -> StatusCode {
-        if let Ok(info_hash) = InfoHash::from_str(&torrent.info_hash) {
-            info!("Inserting torrent with id {}.", torrent.id);
-            let old_torrent = tracker.torrents.lock().swap_remove(&torrent.id);
-            let peers = old_torrent.unwrap_or_default().peers;
-
-            tracker.torrents.lock().insert(
-                torrent.id,
-                Torrent {
-                    id: torrent.id,
-                    status: torrent.status,
-                    is_deleted: torrent.is_deleted,
-                    seeders: torrent.seeders,
-                    leechers: torrent.leechers,
-                    times_completed: torrent.times_completed,
-                    download_factor: torrent.download_factor,
-                    upload_factor: torrent.upload_factor,
-                    peers,
-                },
-            );
-
-            tracker.infohash2id.write().insert(info_hash, torrent.id);
-
-            return StatusCode::OK;
-        }
-
-        StatusCode::BAD_REQUEST
-    }
-
-    pub async fn destroy(
-        State(tracker): State<Arc<Tracker>>,
-        Json(torrent): Json<APIRemoveTorrent>,
-    ) -> StatusCode {
-        let mut torrent_guard = tracker.torrents.lock();
-
-        if let Some(torrent) = torrent_guard.get_mut(&torrent.id) {
-            info!("Removing torrent with id {}.", torrent.id);
-            torrent.is_deleted = true;
-
-            return StatusCode::OK;
-        }
-
-        StatusCode::BAD_REQUEST
-    }
-
-    pub async fn show(
-        State(tracker): State<Arc<Tracker>>,
-        Path(id): Path<u32>,
-    ) -> Result<Json<Torrent>, StatusCode> {
-        tracker
-            .torrents
-            .lock()
-            .get(&id)
-            .map(|torrent| Json(torrent.clone()))
-            .ok_or(StatusCode::NOT_FOUND)
+            Ok(store)
+        })
+        .await
+        .context("Failed loading peers.")
     }
 }
 
-impl Deref for Map {
+impl Deref for TorrentStore {
     type Target = IndexMap<u32, Torrent>;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.inner
     }
 }
 
-impl DerefMut for Map {
+impl DerefMut for TorrentStore {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        &mut self.inner
     }
 }
 
 #[derive(Clone, Default)]
 pub struct DBImportTorrent {
     pub id: u32,
-    pub status: Status,
+    pub status: TorrentStatus,
     pub seeders: u32,
     pub leechers: u32,
     pub times_completed: u32,
@@ -233,30 +161,12 @@ pub struct DBImportTorrent {
 #[derive(Clone, Default, Serialize)]
 pub struct Torrent {
     pub id: u32,
-    pub status: Status,
+    pub status: TorrentStatus,
     pub is_deleted: bool,
-    pub peers: peer::Map,
+    pub peers: PeerStore,
     pub seeders: u32,
     pub leechers: u32,
     pub times_completed: u32,
     pub download_factor: u8,
     pub upload_factor: u8,
-}
-
-#[derive(Clone, Deserialize)]
-pub struct APIInsertTorrent {
-    pub id: u32,
-    pub status: Status,
-    pub info_hash: String,
-    pub is_deleted: bool,
-    pub seeders: u32,
-    pub leechers: u32,
-    pub times_completed: u32,
-    pub download_factor: u8,
-    pub upload_factor: u8,
-}
-
-#[derive(Clone, Deserialize)]
-pub struct APIRemoveTorrent {
-    pub id: u32,
 }

@@ -17,7 +17,7 @@ High-performance backend BitTorrent tracker compatible with UNIT3D tracker softw
 $ cd /var/www/html
 
 # Clone this repository
-$ git clone -b v0.3 https://github.com/HDInnovations/UNIT3D-Announce unit3d-announce
+$ git clone -b v0.3.1 https://github.com/HDInnovations/UNIT3D-Announce unit3d-announce
 
 # Go into the repository
 $ cd unit3d-announce
@@ -52,7 +52,7 @@ $ sudo nano config/announce.php
 $ cd /var/www/html/unit3d-announce
 
 # Pull the new updates
-$ git pull origin v0.3
+$ git pull origin v0.3.1
 
 # Review changes to the configuration
 $ diff -u .env .env.example
@@ -101,6 +101,10 @@ Uncomment and set `REVERSE_PROXY_CLIENT_IP_HEADER_NAME` in the .env file to `X-R
 # Reload nginx once finished
 $ service nginx reload
 ```
+
+### Optimizations
+
+Building nginx with aws-lc as the TLS library improves throughput with non-persistent connections (common with libtorrent-rasterbar clients) by approximately 18%.
 
 ## Supervisor
 

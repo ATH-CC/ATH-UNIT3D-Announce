@@ -16,13 +16,17 @@ use tikv_jemallocator::Jemalloc;
 static GLOBAL: Jemalloc = Jemalloc;
 
 mod announce;
+mod api;
 mod config;
 mod error;
+mod model;
+mod queue;
 mod rate;
 mod routes;
 mod scheduler;
+mod state;
 mod stats;
-mod tracker;
+mod store;
 mod utils;
 mod warning;
 
@@ -43,27 +47,27 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    // The Tracker struct keeps track of all state within the application.
-    let tracker = tracker::Tracker::default().await?;
+    // The state struct keeps track of all state within the application.
+    let state = state::AppState::default().await?;
 
     // Starts scheduler to automate flushing updates
     // to database and inactive peer removal.
     let _handle = tokio::spawn({
-        let tracker = tracker.clone();
+        let state = state.clone();
 
         async move {
-            scheduler::handle(&tracker).await;
+            scheduler::handle(&state).await;
         }
     });
 
     // Create router.
     let app = Router::new()
-        .merge(routes::routes(tracker.clone()))
-        .with_state(tracker.clone());
+        .merge(routes::routes(state.clone()))
+        .with_state(state.clone());
 
     // Ensure lock is dropped before axum::serve() is called otherwise
     // reloading config triggers a deadlock
-    let config = tracker.config.read().clone();
+    let config = state.config.load().clone();
 
     if let Some(path) = config.listening_unix_socket.to_owned() {
         // Create unix domain socket.
@@ -102,13 +106,8 @@ async fn main() -> Result<()> {
     let max_flushes = 1000;
     let mut flushes = 0;
 
-    while flushes < max_flushes
-        && (tracker.history_updates.lock().is_not_empty()
-            || tracker.peer_updates.lock().is_not_empty()
-            || tracker.torrent_updates.lock().is_not_empty()
-            || tracker.user_updates.lock().is_not_empty())
-    {
-        scheduler::flush(&tracker).await;
+    while flushes < max_flushes && state.queues.are_not_empty() {
+        state.queues.flush(&state).await;
         flushes += 1;
     }
 

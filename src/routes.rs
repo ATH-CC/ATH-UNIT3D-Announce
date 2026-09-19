@@ -6,14 +6,9 @@ use axum::{
     routing::{get, post, put},
 };
 
-use crate::{
-    announce,
-    config::Config,
-    stats,
-    tracker::{self, Tracker},
-};
+use crate::{announce, api, config::Config, state::AppState, stats};
 
-pub fn routes(state: Arc<Tracker>) -> Router<Arc<Tracker>> {
+pub fn routes(state: Arc<AppState>) -> Router<Arc<AppState>> {
     Router::new()
         .nest(
             "/announce",
@@ -24,42 +19,37 @@ pub fn routes(state: Arc<Tracker>) -> Router<Arc<Tracker>> {
                     Router::new().route("/ping", get(|| async { "PONG" })),
                 )
                 .nest(
-                    &("/".to_string() + &state.config.read().apikey),
+                    &("/".to_string() + &state.config.load().apikey),
                     Router::new()
                         .route(
                             "/torrents",
-                            put(tracker::torrent::Map::upsert)
-                                .delete(tracker::torrent::Map::destroy),
+                            put(api::torrent::upsert).delete(api::torrent::destroy),
                         )
-                        .route("/torrents/{id}", get(tracker::torrent::Map::show))
-                        .route(
-                            "/users",
-                            put(tracker::user::Map::upsert).delete(tracker::user::Map::destroy),
-                        )
-                        .route("/users/{id}", get(tracker::user::Map::show))
+                        .route("/torrents/{id}", get(api::torrent::show))
+                        .route("/users", put(api::user::upsert).delete(api::user::destroy))
+                        .route("/users/{id}", get(api::user::show))
                         .route(
                             "/groups",
-                            put(tracker::group::Map::upsert).delete(tracker::group::Map::destroy),
+                            put(api::group::upsert).delete(api::group::destroy),
                         )
                         .route(
                             "/blacklisted-agents",
-                            put(tracker::blacklisted_agent::Set::upsert)
-                                .delete(tracker::blacklisted_agent::Set::destroy),
+                            put(api::blacklisted_agent::upsert)
+                                .delete(api::blacklisted_agent::destroy),
                         )
                         .route(
                             "/freeleech-tokens",
-                            put(tracker::freeleech_token::Set::upsert)
-                                .delete(tracker::freeleech_token::Set::destroy),
+                            put(api::freeleech_token::upsert).delete(api::freeleech_token::destroy),
                         )
                         .route(
                             "/personal-freeleech",
-                            put(tracker::personal_freeleech::Set::upsert)
-                                .delete(tracker::personal_freeleech::Set::destroy),
+                            put(api::personal_freeleech::upsert)
+                                .delete(api::personal_freeleech::destroy),
                         )
                         .route(
                             "/featured-torrents",
-                            put(tracker::featured_torrent::Set::upsert)
-                                .delete(tracker::featured_torrent::Set::destroy),
+                            put(api::featured_torrent::upsert)
+                                .delete(api::featured_torrent::destroy),
                         )
                         .route("/stats", get(crate::stats::show))
                         .route("/config/reload", post(Config::reload)),

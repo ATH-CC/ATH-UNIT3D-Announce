@@ -7,10 +7,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use sqlx::{MySql, QueryBuilder};
 
-use crate::{
-    announce::Event,
-    tracker::{Tracker, peer::PeerId},
-};
+use crate::{announce::Event, model::peer_id::PeerId, state::AppState};
 
 pub struct Queue(pub Vec<AnnounceUpdate>);
 
@@ -65,7 +62,7 @@ impl Queue {
     }
 
     /// Flushes announce updates to the mysql db
-    pub async fn flush_to_db(&self, tracker: &Arc<Tracker>) -> Result<u64, sqlx::Error> {
+    pub async fn flush_to_db(&self, state: &Arc<AppState>) -> Result<u64, sqlx::Error> {
         let len = self.len();
 
         if len == 0 {
@@ -117,7 +114,7 @@ impl Queue {
         query_builder
             .build()
             .persistent(false)
-            .execute(&tracker.pool)
+            .execute(&state.pool)
             .await
             .map(|result| result.rows_affected())
     }

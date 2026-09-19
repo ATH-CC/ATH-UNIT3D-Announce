@@ -10,7 +10,9 @@ use sqlx::types::chrono::{DateTime, Utc};
 use anyhow::{Context, Result};
 
 #[derive(Clone)]
-pub struct Map(IndexMap<SocketAddr, ConnectablePort>);
+pub struct ConnectablePortStore {
+    inner: IndexMap<SocketAddr, ConnectablePort>,
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct ConnectablePort {
@@ -18,13 +20,15 @@ pub struct ConnectablePort {
     pub updated_at: DateTime<Utc>,
 }
 
-impl Map {
-    pub fn new() -> Map {
-        Map(IndexMap::new())
+impl ConnectablePortStore {
+    pub fn new() -> ConnectablePortStore {
+        ConnectablePortStore {
+            inner: IndexMap::new(),
+        }
     }
 
-    pub async fn from_db(db: &MySqlPool) -> Result<Map> {
-        let mut peers = sqlx::query!(
+    pub async fn from_db(db: &MySqlPool) -> Result<ConnectablePortStore> {
+        sqlx::query!(
             r#"
                 SELECT
                     INET6_NTOA(peers.ip) as `ip_address: String`,
@@ -37,50 +41,49 @@ impl Map {
                     peers.ip, peers.port
             "#
         )
-        .fetch(db);
-
-        let mut peer_map = Map::new();
-
-        while let Some(peer) = peers.try_next().await.context("Failed loading peers.")? {
-            peer_map.insert(
+        .fetch(db)
+        .try_fold(ConnectablePortStore::new(), |mut store, peer| async move {
+            store.insert(
                 SocketAddr::from((
                     IpAddr::from_str(
                         &peer
                             .ip_address
-                            .context("INET6_NTOA failed to decode peer ip.")?,
+                            .expect("INET6_NTOA failed to decode peer ip."),
                     )
-                    .context("Peer ip failed to decode.")?,
+                    .expect("Peer ip failed to decode."),
                     peer.port,
                 )),
                 ConnectablePort {
                     connectable: peer.connectable,
                     updated_at: peer
                         .updated_at
-                        .context("Peer with a null updated_at found in database.")?,
+                        .expect("Peer with a null updated_at found in database."),
                 },
             );
-        }
 
-        Ok(peer_map)
+            Ok(store)
+        })
+        .await
+        .context("Failed loading peers.")
     }
 }
 
-impl Deref for Map {
+impl Deref for ConnectablePortStore {
     type Target = IndexMap<SocketAddr, ConnectablePort>;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.inner
     }
 }
 
-impl DerefMut for Map {
+impl DerefMut for ConnectablePortStore {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        &mut self.inner
     }
 }
 
-impl Default for Map {
+impl Default for ConnectablePortStore {
     fn default() -> Self {
-        Map::new()
+        ConnectablePortStore::new()
     }
 }
