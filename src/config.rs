@@ -74,6 +74,11 @@ pub struct Config {
     /// as well as keeps the peer lists from being filled with too many clients
     /// of a single user.
     pub max_peers_per_torrent_per_user: u16,
+    /// On torrents with upload priority enabled, a user's peers are withheld
+    /// from peer lists once their total upload on the torrent reaches this
+    /// percentage of the torrent size. 500 means 5x the torrent size. 0
+    /// disables withholding.
+    pub upload_cap_threshold: u64,
     /// Open a connection to the incoming peer announcing and record if their
     /// socket accepts the connection.
     pub is_connectivity_check_enabled: bool,
@@ -249,6 +254,11 @@ impl Config {
             .parse()
             .context("MAX_PEERS_PER_TORRENT_PER_USER must be a number between 0 and 2^16 - 1")?;
 
+        let upload_cap_threshold = env::var("UPLOAD_CAP_THRESHOLD")
+            .context("UPLOAD_CAP_THRESHOLD not found in .env file.")?
+            .parse()
+            .context("UPLOAD_CAP_THRESHOLD must be a number between 0 and 2^64 - 1")?;
+
         let is_connectivity_check_enabled = env::var("IS_CONNECTIVITY_CHECK_ENABLED")
             .context("IS_CONNECTIVITY_CHECK_ENABLED not found in .env file.")?
             .parse()
@@ -366,6 +376,7 @@ impl Config {
             listening_port,
             listening_unix_socket,
             max_peers_per_torrent_per_user,
+            upload_cap_threshold,
             is_connectivity_check_enabled,
             connectivity_check_interval,
             require_peer_connectivity,

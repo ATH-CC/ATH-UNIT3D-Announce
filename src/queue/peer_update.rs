@@ -28,6 +28,7 @@ pub struct PeerUpdate {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub connectable: bool,
+    pub is_upload_capped: bool,
 }
 
 impl Mergeable for PeerUpdate {
@@ -44,6 +45,7 @@ impl Mergeable for PeerUpdate {
             self.left = new.left;
             self.updated_at = new.updated_at;
             self.connectable = new.connectable;
+            self.is_upload_capped = new.is_upload_capped;
         }
 
         self.created_at = std::cmp::min(self.created_at, new.created_at);
@@ -74,7 +76,8 @@ impl Flushable<PeerUpdate> for super::Batch<Index, PeerUpdate> {
                         updated_at,
                         torrent_id,
                         user_id,
-                        connectable
+                        connectable,
+                        upload_capped
                     )
             "#,
         );
@@ -100,7 +103,8 @@ impl Flushable<PeerUpdate> for super::Batch<Index, PeerUpdate> {
                     .push_bind(peer_update.updated_at)
                     .push_bind(index.torrent_id)
                     .push_bind(index.user_id)
-                    .push_bind(peer_update.connectable);
+                    .push_bind(peer_update.connectable)
+                    .push_bind(peer_update.is_upload_capped);
             })
             // Mysql 8.0.20 deprecates use of VALUES() so will have to update it eventually to use aliases instead
             // However, Mariadb doesn't yet support aliases
@@ -117,7 +121,8 @@ impl Flushable<PeerUpdate> for super::Batch<Index, PeerUpdate> {
                     seeder = VALUES(seeder),
                     visible = VALUES(visible),
                     updated_at = VALUES(updated_at),
-                    connectable = VALUES(connectable)
+                    connectable = VALUES(connectable),
+                    upload_capped = VALUES(upload_capped)
             "#,
             );
 
@@ -127,5 +132,65 @@ impl Flushable<PeerUpdate> for super::Batch<Index, PeerUpdate> {
             .execute(&state.pool)
             .await
             .map(|result| result.rows_affected())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Tests that the `upload_capped` column written to the peers table
+    //! follows the same "newest update wins" rule as the other peer fields
+    //! when several announces are merged in the queue before a flush.
+
+    use super::*;
+
+    use chrono::Duration;
+
+    /// Builds a queued peer update with the given timestamp and cap flag.
+    fn make_update(updated_at: DateTime<Utc>, is_upload_capped: bool) -> PeerUpdate {
+        PeerUpdate {
+            ip: IpAddr::from([127, 0, 0, 1]),
+            port: 6881,
+            agent: String::from("qBittorrent/5.0.0"),
+            uploaded: 0,
+            downloaded: 0,
+            is_active: true,
+            is_seeder: true,
+            is_visible: true,
+            left: 0,
+            created_at: updated_at,
+            updated_at,
+            connectable: true,
+            is_upload_capped,
+        }
+    }
+
+    /// A peer that becomes capped between two announces must be flushed as
+    /// capped.
+    #[test]
+    fn merge_takes_upload_cap_from_newer_update() {
+        let now = Utc::now();
+        let mut queued = make_update(now, false);
+
+        queued.merge(&make_update(now + Duration::seconds(1), true));
+
+        assert!(
+            queued.is_upload_capped,
+            "the newer update's cap flag must replace the queued one"
+        );
+    }
+
+    /// Updates can arrive out of order. An older update must not overwrite
+    /// the cap flag of a newer one that's already queued.
+    #[test]
+    fn merge_keeps_upload_cap_when_update_is_older() {
+        let now = Utc::now();
+        let mut queued = make_update(now, true);
+
+        queued.merge(&make_update(now - Duration::seconds(1), false));
+
+        assert!(
+            queued.is_upload_capped,
+            "an older update must not replace the queued cap flag"
+        );
     }
 }

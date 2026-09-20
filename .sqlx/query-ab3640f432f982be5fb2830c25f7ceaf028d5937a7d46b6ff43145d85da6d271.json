@@ -1,0 +1,34 @@
+{
+  "db_name": "MySQL",
+  "query": "\n                SELECT\n                    history.user_id as `user_id: u32`,\n                    history.actual_uploaded as `actual_uploaded: u64`\n                FROM\n                    history\n                WHERE\n                    history.torrent_id = ?\n                    AND history.actual_uploaded > 0\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "user_id: u32",
+        "type_info": {
+          "type": "Long",
+          "flags": "NOT_NULL | PRIMARY_KEY | MULTIPLE_KEY | UNSIGNED | NO_DEFAULT_VALUE",
+          "max_size": 10
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "actual_uploaded: u64",
+        "type_info": {
+          "type": "LongLong",
+          "flags": "NOT_NULL | UNSIGNED",
+          "max_size": 20
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "ab3640f432f982be5fb2830c25f7ceaf028d5937a7d46b6ff43145d85da6d271"
+}
