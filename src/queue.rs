@@ -45,7 +45,7 @@ impl Queues {
             )),
             peers: Mutex::new(Queue::<peer_update::Index, PeerUpdate>::new(QueueConfig {
                 max_bindings_per_flush: 65_535,
-                bindings_per_record: 15,
+                bindings_per_record: 16,
                 extra_bindings_per_flush: 0,
             })),
             torrents: Mutex::new(Queue::<torrent_update::Index, TorrentUpdate>::new(

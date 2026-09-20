@@ -35,6 +35,9 @@ pub struct Peer {
     pub updated_at: DateTime<Utc>,
     pub uploaded: u64,
     pub downloaded: u64,
+    /// Cached result of `upload_total::is_over_upload_cap` for this peer's
+    /// user. Only read when the torrent has `upload_cap` enabled.
+    pub is_upload_capped: bool,
 }
 
 impl Peer {
