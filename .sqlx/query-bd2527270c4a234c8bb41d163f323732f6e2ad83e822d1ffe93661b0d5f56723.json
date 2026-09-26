@@ -1,0 +1,114 @@
+{
+  "db_name": "MySQL",
+  "query": "\n                SELECT\n                    torrents.id as `id: u32`,\n                    torrents.status as `status: TorrentStatus`,\n                    torrents.seeders as `seeders: u32`,\n                    torrents.leechers as `leechers: u32`,\n                    torrents.times_completed as `times_completed: u32`,\n                    100 - LEAST(torrents.free, 100) as `download_factor: u8`,\n                    IF(torrents.doubleup, 200, 100) as `upload_factor: u8`,\n                    torrents.deleted_at IS NOT NULL as `is_deleted: bool`,\n                    CAST(torrents.size AS UNSIGNED) as `size: u64`,\n                    torrents.upload_cap as `upload_cap: bool`\n                FROM\n                    torrents\n                JOIN (\n                    SELECT\n                        COALESCE(\n                            MIN(CASE WHEN deleted_at IS NULL AND status = 1 THEN id END),\n                            MIN(CASE WHEN deleted_at IS NULL AND status != 1 THEN id END),\n                            MIN(CASE WHEN deleted_at IS NOT NULL THEN id END)\n                        ) AS id\n                    FROM\n                        torrents\n                    GROUP BY\n                        info_hash\n                ) AS distinct_torrents\n                    ON distinct_torrents.id = torrents.id\n            ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: u32",
+        "type_info": {
+          "type": "Long",
+          "flags": "NOT_NULL | PRIMARY_KEY | UNSIGNED | AUTO_INCREMENT",
+          "max_size": 10
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "status: TorrentStatus",
+        "type_info": {
+          "type": "Short",
+          "flags": "NOT_NULL | MULTIPLE_KEY",
+          "max_size": 6
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "seeders: u32",
+        "type_info": {
+          "type": "Long",
+          "flags": "NOT_NULL | MULTIPLE_KEY",
+          "max_size": 11
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "leechers: u32",
+        "type_info": {
+          "type": "Long",
+          "flags": "NOT_NULL | MULTIPLE_KEY",
+          "max_size": 11
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "times_completed: u32",
+        "type_info": {
+          "type": "Long",
+          "flags": "NOT_NULL",
+          "max_size": 11
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "download_factor: u8",
+        "type_info": {
+          "type": "LongLong",
+          "flags": "NOT_NULL | BINARY",
+          "max_size": 7
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "upload_factor: u8",
+        "type_info": {
+          "type": "LongLong",
+          "flags": "NOT_NULL | BINARY",
+          "max_size": 4
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "is_deleted: bool",
+        "type_info": {
+          "type": "LongLong",
+          "flags": "NOT_NULL | BINARY",
+          "max_size": 1
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "size: u64",
+        "type_info": {
+          "type": "LongLong",
+          "flags": "NOT_NULL | UNSIGNED | BINARY",
+          "max_size": 21
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "upload_cap: bool",
+        "type_info": {
+          "type": "Tiny",
+          "flags": "NOT_NULL",
+          "max_size": 1
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "bd2527270c4a234c8bb41d163f323732f6e2ad83e822d1ffe93661b0d5f56723"
+}
