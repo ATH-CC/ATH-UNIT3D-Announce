@@ -17,7 +17,7 @@
         "name": "user_id: u32",
         "type_info": {
           "type": "Long",
-          "flags": "NOT_NULL | PRIMARY_KEY | UNSIGNED | NO_DEFAULT_VALUE",
+          "flags": "NOT_NULL | PRIMARY_KEY | MULTIPLE_KEY | UNSIGNED | NO_DEFAULT_VALUE",
           "max_size": 10
         }
       },
@@ -44,7 +44,7 @@
         "name": "is_seeder: bool",
         "type_info": {
           "type": "Tiny",
-          "flags": "NOT_NULL | MULTIPLE_KEY | NO_DEFAULT_VALUE",
+          "flags": "NOT_NULL | NO_DEFAULT_VALUE",
           "max_size": 1
         }
       },
@@ -53,7 +53,7 @@
         "name": "is_active: bool",
         "type_info": {
           "type": "Tiny",
-          "flags": "NOT_NULL | MULTIPLE_KEY | NO_DEFAULT_VALUE",
+          "flags": "NOT_NULL | NO_DEFAULT_VALUE",
           "max_size": 1
         }
       },
@@ -80,7 +80,7 @@
         "name": "updated_at: DateTime<Utc>",
         "type_info": {
           "type": "Timestamp",
-          "flags": "BINARY",
+          "flags": "MULTIPLE_KEY | BINARY",
           "max_size": 19
         }
       },

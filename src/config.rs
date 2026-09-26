@@ -74,7 +74,7 @@ pub struct Config {
     /// as well as keeps the peer lists from being filled with too many clients
     /// of a single user.
     pub max_peers_per_torrent_per_user: u16,
-    /// On torrents with upload priority enabled, a user's peers are withheld
+    /// On torrents with upload cap enabled, a user's peers are withheld
     /// from peer lists once their total upload on the torrent reaches this
     /// percentage of the torrent size. 500 means 5x the torrent size. 0
     /// disables withholding.

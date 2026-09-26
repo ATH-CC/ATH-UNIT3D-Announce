@@ -65,7 +65,7 @@ impl Stores {
 
         print!("Starting to load  3/11: torrents                       ... ");
         io::stdout().flush().unwrap();
-        let torrents = TorrentStore::from_db(&pool, &config).await?;
+        let torrents = TorrentStore::from_db(&pool, config.upload_cap_threshold).await?;
         println!("[Finished] Records: {:?}", torrents.len());
 
         print!("Starting to load  4/11: infohash to torrent id mappings... ");

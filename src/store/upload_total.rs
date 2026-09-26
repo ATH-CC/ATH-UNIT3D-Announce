@@ -66,7 +66,7 @@ impl DerefMut for UploadTotalStore {
 /// 0 never caps.
 ///
 /// Integer math only: widened to u128 so the multiplication can't overflow.
-#[inline(always)]
+#[inline]
 pub fn is_over_upload_cap(uploaded: u64, size: u64, threshold_percent: u64) -> bool {
     threshold_percent != 0
         && size != 0

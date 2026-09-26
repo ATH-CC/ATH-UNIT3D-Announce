@@ -18,7 +18,7 @@
         "type_info": {
           "type": "VarString",
           "flags": "NOT_NULL | UNIQUE_KEY | NO_DEFAULT_VALUE",
-          "max_size": 1020
+          "max_size": 360
         }
       },
       {
@@ -35,7 +35,7 @@
         "name": "is_immune: bool",
         "type_info": {
           "type": "Tiny",
-          "flags": "NOT_NULL",
+          "flags": "NOT_NULL | NO_DEFAULT_VALUE",
           "max_size": 1
         }
       },

@@ -9,7 +9,6 @@ use sqlx::types::chrono::{DateTime, Utc};
 
 use anyhow::{Context, Result};
 
-use crate::config::Config;
 use crate::model::{peer_id::PeerId, torrent_status::TorrentStatus};
 use crate::store::peer::{Index, Peer, PeerStore};
 use crate::store::upload_total::{UploadTotalStore, is_over_upload_cap};
@@ -25,7 +24,7 @@ impl TorrentStore {
         }
     }
 
-    pub async fn from_db(db: &MySqlPool, config: &Config) -> Result<TorrentStore> {
+    pub async fn from_db(db: &MySqlPool, upload_cap_threshold: u64) -> Result<TorrentStore> {
         // Load one torrent per info hash. If multiple are found, prefer
         // undeleted torrents. If multiple are still found, prefer approved
         // torrents. If multiple are still found, prefer the oldest.
@@ -85,7 +84,7 @@ impl TorrentStore {
         .await
         .context("Failed loading torrents.")?;
 
-        // Load each user's total upload into torrents with upload priority
+        // Load each user's total upload into torrents with upload cap
         let torrents = sqlx::query!(
             r#"
                 SELECT
@@ -169,7 +168,7 @@ impl TorrentStore {
 
         for torrent in torrents.values_mut() {
             if torrent.upload_cap {
-                torrent.refresh_upload_caps(config.upload_cap_threshold);
+                torrent.refresh_upload_caps(upload_cap_threshold);
             }
         }
 
@@ -242,7 +241,7 @@ impl Torrent {
 
     /// Adds `uploaded_delta` to the user's total upload on this torrent and
     /// refreshes the cached cap flag of their peers. Returns whether the
-    /// user is capped afterwards, or false if upload priority is disabled.
+    /// user is capped afterwards, or false if upload cap is disabled.
     pub fn record_upload(
         &mut self,
         user_id: u32,
@@ -263,19 +262,19 @@ impl Torrent {
 
         let was_capped = is_over_upload_cap(previous_total, self.size, threshold_percent);
         let is_capped = is_over_upload_cap(total, self.size, threshold_percent);
+        let announcing_peer_is_stale = self
+            .peers
+            .get(&Index { user_id, peer_id })
+            .is_some_and(|peer| peer.is_upload_capped != is_capped);
 
-        if was_capped != is_capped {
-            // The user just crossed the threshold. Rare, so a scan over the
-            // swarm to update all of the user's peers is acceptable.
+        // Crossing the threshold, or a stale flag after a threshold change,
+        // updates every client of the user. Both are rare.
+        if was_capped != is_capped || announcing_peer_is_stale {
             for (index, peer) in self.peers.iter_mut() {
                 if index.user_id == user_id {
                     peer.is_upload_capped = is_capped;
                 }
             }
-        } else if let Some(peer) = self.peers.get_mut(&Index { user_id, peer_id }) {
-            // Also corrects the flag after a config reload changed the
-            // threshold.
-            peer.is_upload_capped = is_capped;
         }
 
         is_capped
@@ -320,8 +319,8 @@ mod tests {
         }
     }
 
-    /// 10 GiB torrent with upload priority enabled.
-    fn prioritized_torrent() -> Torrent {
+    /// 10 GiB torrent with upload cap enabled.
+    fn upload_capped_torrent() -> Torrent {
         Torrent {
             size: 10 * GIB,
             upload_cap: true,
@@ -342,7 +341,7 @@ mod tests {
     /// history queue adds to `history.actual_uploaded`.
     #[test]
     fn record_upload_accumulates_total() {
-        let mut torrent = prioritized_torrent();
+        let mut torrent = upload_capped_torrent();
         torrent.peers.insert(index(1, 1), make_peer(false));
 
         torrent.record_upload(1, PeerId([1; 20]), 3 * GIB, 500);
@@ -355,11 +354,11 @@ mod tests {
         );
     }
 
-    /// Torrents without upload priority must not use memory for totals or
+    /// Torrents without upload cap must not use memory for totals or
     /// cap anyone, however much they upload.
     #[test]
     fn record_upload_does_nothing_without_upload_cap() {
-        let mut torrent = prioritized_torrent();
+        let mut torrent = upload_capped_torrent();
         torrent.upload_cap = false;
         torrent.peers.insert(index(1, 1), make_peer(false));
 
@@ -368,7 +367,7 @@ mod tests {
         assert!(!capped, "the user must not be reported as capped");
         assert!(
             torrent.upload_totals.is_empty(),
-            "no total must be stored for a torrent without upload priority"
+            "no total must be stored for a torrent without upload cap"
         );
         assert!(
             !is_capped(&torrent, index(1, 1)),
@@ -380,7 +379,7 @@ mod tests {
     /// for each of them would grow the map for nothing.
     #[test]
     fn record_upload_does_not_store_zero_deltas() {
-        let mut torrent = prioritized_torrent();
+        let mut torrent = upload_capped_torrent();
         torrent.peers.insert(index(1, 1), make_peer(false));
 
         torrent.record_upload(1, PeerId([1; 20]), 0, 500);
@@ -394,7 +393,7 @@ mod tests {
     /// 49 GiB on a 10 GiB torrent is 490%, below the 500% threshold.
     #[test]
     fn record_upload_below_threshold_is_not_capped() {
-        let mut torrent = prioritized_torrent();
+        let mut torrent = upload_capped_torrent();
         torrent.peers.insert(index(1, 1), make_peer(false));
 
         let capped = torrent.record_upload(1, PeerId([1; 20]), 49 * GIB, 500);
@@ -411,7 +410,7 @@ mod tests {
     /// their own next announce.
     #[test]
     fn record_upload_caps_all_peers_of_user_when_crossing_threshold() {
-        let mut torrent = prioritized_torrent();
+        let mut torrent = upload_capped_torrent();
         torrent.peers.insert(index(1, 1), make_peer(false));
         torrent.peers.insert(index(1, 2), make_peer(false));
         torrent.peers.insert(index(2, 3), make_peer(false));
@@ -439,7 +438,7 @@ mod tests {
     /// capped on its very first announce, even without uploading.
     #[test]
     fn record_upload_uses_existing_total_from_history() {
-        let mut torrent = prioritized_torrent();
+        let mut torrent = upload_capped_torrent();
         torrent.upload_totals.insert(1, 60 * GIB);
         torrent.peers.insert(index(1, 1), make_peer(false));
 
@@ -457,7 +456,7 @@ mod tests {
     /// but the announcing peer's stale flag must still be cleared.
     #[test]
     fn record_upload_uncaps_after_threshold_is_raised() {
-        let mut torrent = prioritized_torrent();
+        let mut torrent = upload_capped_torrent();
         torrent.upload_totals.insert(1, 60 * GIB);
         torrent.peers.insert(index(1, 1), make_peer(true));
 
@@ -470,12 +469,26 @@ mod tests {
         );
     }
 
+    /// After a threshold change, the first announce of any client must
+    /// correct the flag on all of the user's clients.
+    #[test]
+    fn record_upload_uncaps_all_peers_of_user_after_threshold_is_raised() {
+        let mut torrent = upload_capped_torrent();
+        torrent.upload_totals.insert(1, 60 * GIB);
+        torrent.peers.insert(index(1, 1), make_peer(true));
+        torrent.peers.insert(index(1, 2), make_peer(true));
+
+        torrent.record_upload(1, PeerId([1; 20]), 0, 1000);
+
+        assert!(!is_capped(&torrent, index(1, 2)));
+    }
+
     /// A torrent sent by an older UNIT3D has size 0. Nobody may be capped,
     /// but totals are still tracked so they're correct once the size is
     /// sent.
     #[test]
     fn record_upload_without_size_never_caps() {
-        let mut torrent = prioritized_torrent();
+        let mut torrent = upload_capped_torrent();
         torrent.size = 0;
         torrent.peers.insert(index(1, 1), make_peer(false));
 
@@ -498,7 +511,7 @@ mod tests {
     /// inactive.
     #[test]
     fn record_upload_capping_leaves_seeding_state_untouched() {
-        let mut torrent = prioritized_torrent();
+        let mut torrent = upload_capped_torrent();
         let seed = Peer {
             uploaded: 7,
             downloaded: 3,
@@ -541,7 +554,7 @@ mod tests {
     /// total, and the missing peer must not cause a panic.
     #[test]
     fn record_upload_for_stopped_peer_still_updates_total() {
-        let mut torrent = prioritized_torrent();
+        let mut torrent = upload_capped_torrent();
 
         let capped = torrent.record_upload(1, PeerId([1; 20]), 60 * GIB, 500);
 
@@ -557,7 +570,7 @@ mod tests {
     /// from the stored totals, overwriting whatever it was before.
     #[test]
     fn refresh_upload_caps_sets_flags_from_totals() {
-        let mut torrent = prioritized_torrent();
+        let mut torrent = upload_capped_torrent();
         torrent.upload_totals.insert(1, 50 * GIB);
         torrent.upload_totals.insert(2, 10 * GIB);
         torrent.peers.insert(index(1, 1), make_peer(false));
@@ -584,7 +597,7 @@ mod tests {
     /// must clear every flag.
     #[test]
     fn refresh_upload_caps_with_zero_threshold_uncaps_everyone() {
-        let mut torrent = prioritized_torrent();
+        let mut torrent = upload_capped_torrent();
         torrent.upload_totals.insert(1, 100 * GIB);
         torrent.peers.insert(index(1, 1), make_peer(true));
 

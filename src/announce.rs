@@ -610,10 +610,9 @@ pub async fn announce(
             }
         }
 
-        // Keep the user's total upload on this torrent in sync with
-        // `history.actual_uploaded` and refresh the cached cap flag, so the
-        // peer list below only has to read a bool per peer. The result is
-        // saved to the peers table so it can be shown in the UI.
+        // Track the user's total upload and refresh the cached cap flag.
+        // The result is written to `peers.upload_capped` for the UI. The
+        // user's other clients are only written on their own next announce.
         let is_upload_capped = torrent.record_upload(
             user_id,
             queries.peer_id,
@@ -665,9 +664,8 @@ pub async fn announce(
                     // leech isn't left without a source.
                     peers.extend(choose_peers(
                         valid_peers.clone(),
-                        true,
+                        PeerKind::Seed,
                         withholds_capped_peers,
-                        true,
                         queries.numwant,
                     ));
                 } else {
@@ -682,9 +680,8 @@ pub async fn announce(
                 if user.receive_leech_list_rates.is_under_limit() {
                     peers.extend(choose_peers(
                         valid_peers,
-                        false,
+                        PeerKind::Leech,
                         withholds_capped_peers,
-                        false,
                         queries.numwant.saturating_sub(peers.len()),
                     ));
                 } else {
@@ -1047,24 +1044,33 @@ async fn check_connectivity(state: &Arc<AppState>, ip: IpAddr, port: u16) -> boo
     false
 }
 
-/// Randomly chooses up to `amount` seeds (`seeders == true`) or leeches from
-/// `peers`, leaving out withheld peers. With `falls_back_to_withheld`,
-/// withheld peers are chosen instead if no other peer is available.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PeerKind {
+    Seed,
+    Leech,
+}
+
+/// Randomly chooses up to `amount` peers of `kind`, leaving out peers of
+/// capped users when `withholds_capped_peers` is set. Seed lists fall back
+/// to capped seeds if no other seed is available.
 fn choose_peers<'a>(
     peers: impl Iterator<Item = (&'a peer::Index, &'a Peer)> + Clone,
-    seeders: bool,
+    kind: PeerKind,
     withholds_capped_peers: bool,
-    falls_back_to_withheld: bool,
     amount: usize,
 ) -> Vec<(&'a peer::Index, &'a Peer)> {
+    let is_seeder = kind == PeerKind::Seed;
+
     let chosen = peers
         .clone()
-        .filter(|(_, peer)| peer.is_seeder == seeders && !peer.is_withheld(withholds_capped_peers))
+        .filter(|(_, peer)| {
+            peer.is_seeder == is_seeder && !(withholds_capped_peers && peer.is_upload_capped)
+        })
         .choose_multiple(&mut rng(), amount);
 
-    if chosen.is_empty() && withholds_capped_peers && falls_back_to_withheld {
+    if chosen.is_empty() && withholds_capped_peers && kind == PeerKind::Seed {
         return peers
-            .filter(|(_, peer)| peer.is_seeder == seeders)
+            .filter(|(_, peer)| peer.is_seeder)
             .choose_multiple(&mut rng(), amount);
     }
 
@@ -1134,7 +1140,7 @@ mod tests {
     fn choose_peers_withholds_capped_seeds_even_with_room() {
         let peers = swarm(&[(1, true, false), (2, true, true), (3, true, false)]);
 
-        let chosen = choose_peers(peers.iter(), true, true, true, 50);
+        let chosen = choose_peers(peers.iter(), PeerKind::Seed, true, 50);
 
         assert_eq!(
             chosen_user_ids(&chosen),
@@ -1143,13 +1149,13 @@ mod tests {
         );
     }
 
-    /// On torrents without upload priority, stale cap flags must have no
+    /// On torrents without upload cap, stale cap flags must have no
     /// effect and every seed is handed out as before this feature.
     #[test]
     fn choose_peers_ignores_cap_when_torrent_does_not_withhold() {
         let peers = swarm(&[(1, true, false), (2, true, true)]);
 
-        let chosen = choose_peers(peers.iter(), true, false, true, 50);
+        let chosen = choose_peers(peers.iter(), PeerKind::Seed, false, 50);
 
         assert_eq!(
             chosen_user_ids(&chosen),
@@ -1165,7 +1171,7 @@ mod tests {
     fn choose_peers_falls_back_to_capped_seeds_when_all_are_capped() {
         let peers = swarm(&[(1, true, true), (2, true, true), (3, false, false)]);
 
-        let chosen = choose_peers(peers.iter(), true, true, true, 50);
+        let chosen = choose_peers(peers.iter(), PeerKind::Seed, true, 50);
 
         assert_eq!(
             chosen_user_ids(&chosen),
@@ -1180,7 +1186,7 @@ mod tests {
     fn choose_peers_does_not_fall_back_for_leeches() {
         let peers = swarm(&[(1, false, true), (2, false, true), (3, true, false)]);
 
-        let chosen = choose_peers(peers.iter(), false, true, false, 50);
+        let chosen = choose_peers(peers.iter(), PeerKind::Leech, true, 50);
 
         assert!(
             chosen.is_empty(),
@@ -1193,7 +1199,7 @@ mod tests {
     fn choose_peers_withholds_capped_leeches() {
         let peers = swarm(&[(1, false, false), (2, false, true), (3, true, false)]);
 
-        let chosen = choose_peers(peers.iter(), false, true, false, 50);
+        let chosen = choose_peers(peers.iter(), PeerKind::Leech, true, 50);
 
         assert_eq!(
             chosen_user_ids(&chosen),
@@ -1209,12 +1215,12 @@ mod tests {
         let peers = swarm(&[(1, true, false), (2, false, false)]);
 
         assert_eq!(
-            chosen_user_ids(&choose_peers(peers.iter(), true, true, true, 50)),
+            chosen_user_ids(&choose_peers(peers.iter(), PeerKind::Seed, true, 50)),
             vec![1],
             "a seed list must contain only seeds"
         );
         assert_eq!(
-            chosen_user_ids(&choose_peers(peers.iter(), false, true, false, 50)),
+            chosen_user_ids(&choose_peers(peers.iter(), PeerKind::Leech, true, 50)),
             vec![2],
             "a leech list must contain only leeches"
         );
@@ -1231,7 +1237,7 @@ mod tests {
             (4, true, true),
         ]);
 
-        let chosen = choose_peers(peers.iter(), true, true, true, 2);
+        let chosen = choose_peers(peers.iter(), PeerKind::Seed, true, 2);
 
         assert_eq!(chosen.len(), 2, "exactly 2 seeds must be chosen");
         assert!(
@@ -1246,7 +1252,7 @@ mod tests {
     fn choose_peers_fallback_respects_amount() {
         let peers = swarm(&[(1, true, true), (2, true, true), (3, true, true)]);
 
-        let chosen = choose_peers(peers.iter(), true, true, true, 2);
+        let chosen = choose_peers(peers.iter(), PeerKind::Seed, true, 2);
 
         assert_eq!(
             chosen.len(),
@@ -1262,7 +1268,7 @@ mod tests {
         let peers = swarm(&[]);
 
         assert!(
-            choose_peers(peers.iter(), true, true, true, 50).is_empty(),
+            choose_peers(peers.iter(), PeerKind::Seed, true, 50).is_empty(),
             "an empty swarm must give an empty peer list"
         );
     }
