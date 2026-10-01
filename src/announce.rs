@@ -384,6 +384,7 @@ pub async fn announce(
         times_completed_delta,
         is_visible,
         is_active_after_stop,
+        is_upload_capped,
         user,
         user_id,
         group,
@@ -527,6 +528,7 @@ pub async fn announce(
                     updated_at: now,
                     uploaded: queries.uploaded,
                     downloaded: queries.downloaded,
+                    is_upload_capped: false,
                 });
 
             is_visible = new_peer.is_visible;
@@ -608,6 +610,20 @@ pub async fn announce(
             }
         }
 
+        // Track the user's total upload and refresh the cached cap flag.
+        // The result is written to `peers.upload_capped` for the UI. The
+        // user's other clients are only written on their own next announce.
+        //
+        // It also decides below whether this peer may be sent leeches.
+        // Recording the upload first means a peer that crosses the threshold
+        // with this announce already gets no leeches in this response.
+        let is_upload_capped = torrent.record_upload(
+            user_id,
+            queries.peer_id,
+            uploaded_delta,
+            config.upload_cap_threshold,
+        );
+
         // Has to be adjusted before the peer list is generated
         torrent.seeders = torrent.seeders.saturating_add_signed(seeder_delta);
         torrent.leechers = torrent.leechers.saturating_add_signed(leecher_delta);
@@ -640,35 +656,61 @@ pub async fn announce(
                 index.user_id != user_id && peer.is_included_in_peer_list(&config)
             });
 
+            // Withhold peers of users who uploaded too much on this torrent
+            let withholds_capped_peers = torrent.upload_cap && config.upload_cap_threshold != 0;
+
+            // Withholding must work in both directions. Leaving a capped peer
+            // out of other peers' lists alone doesn't stop it from uploading:
+            // it would still learn the leeches' addresses from its own
+            // announce and connect to them itself. See `receives_leech_list`.
+            let announcer_kind = if queries.left == 0 {
+                PeerKind::Seed
+            } else {
+                PeerKind::Leech
+            };
+            let announcer_receives_leech_list = receives_leech_list(
+                valid_peers.clone(),
+                announcer_kind,
+                withholds_capped_peers,
+                is_upload_capped,
+            );
+
             // Make sure leech peer lists are filled with seeds
             if queries.left > 0 && torrent.seeders > 0 && queries.numwant > peers.len() {
                 has_requested_seed_list = true;
 
                 if user.receive_seed_list_rates.is_under_limit() {
-                    peers.extend(
-                        valid_peers
-                            .clone()
-                            .filter(|(_, peer)| peer.is_seeder)
-                            .choose_multiple(&mut rng(), queries.numwant),
-                    );
+                    // If every seed is withheld, send them anyway so the
+                    // leech isn't left without a source.
+                    peers.extend(choose_peers(
+                        valid_peers.clone(),
+                        PeerKind::Seed,
+                        withholds_capped_peers,
+                        queries.numwant,
+                    ));
                 } else {
                     is_over_seed_list_rate_limit = true;
                 }
             }
 
-            // Otherwise only send leeches until the numwant is reached
-            if torrent.leechers > 0 && queries.numwant > peers.len() {
+            // Otherwise only send leeches until the numwant is reached.
+            //
+            // Capped peers get no leeches at all. The list then doesn't count
+            // as requested either, so skipping it doesn't tick the user's
+            // leech list rate limit for a list they never received.
+            if announcer_receives_leech_list
+                && torrent.leechers > 0
+                && queries.numwant > peers.len()
+            {
                 has_requested_leech_list = true;
 
                 if user.receive_leech_list_rates.is_under_limit() {
-                    peers.extend(
-                        valid_peers
-                            .filter(|(_, peer)| !peer.is_seeder)
-                            .choose_multiple(
-                                &mut rng(),
-                                queries.numwant.saturating_sub(peers.len()),
-                            ),
-                    );
+                    peers.extend(choose_peers(
+                        valid_peers,
+                        PeerKind::Leech,
+                        withholds_capped_peers,
+                        queries.numwant.saturating_sub(peers.len()),
+                    ));
                 } else {
                     is_over_leech_list_rate_limit = true;
                 }
@@ -801,6 +843,7 @@ pub async fn announce(
             times_completed_delta,
             is_visible,
             is_active_after_stop,
+            is_upload_capped,
             user,
             user_id,
             group,
@@ -897,6 +940,7 @@ pub async fn announce(
             created_at: now,
             updated_at: now,
             connectable: is_connectable,
+            is_upload_capped,
         },
     );
 
@@ -1025,4 +1069,385 @@ async fn check_connectivity(state: &Arc<AppState>, ip: IpAddr, port: u16) -> boo
     }
 
     false
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PeerKind {
+    Seed,
+    Leech,
+}
+
+/// Randomly chooses up to `amount` peers of `kind`, leaving out peers of
+/// capped users when `withholds_capped_peers` is set. Seed lists fall back
+/// to capped seeds if no other seed is available.
+fn choose_peers<'a>(
+    peers: impl Iterator<Item = (&'a peer::Index, &'a Peer)> + Clone,
+    kind: PeerKind,
+    withholds_capped_peers: bool,
+    amount: usize,
+) -> Vec<(&'a peer::Index, &'a Peer)> {
+    let is_seeder = kind == PeerKind::Seed;
+
+    let chosen = peers
+        .clone()
+        .filter(|(_, peer)| {
+            peer.is_seeder == is_seeder && !(withholds_capped_peers && peer.is_upload_capped)
+        })
+        .choose_multiple(&mut rng(), amount);
+
+    if chosen.is_empty() && withholds_capped_peers && kind == PeerKind::Seed {
+        return peers
+            .filter(|(_, peer)| peer.is_seeder)
+            .choose_multiple(&mut rng(), amount);
+    }
+
+    chosen
+}
+
+/// Whether the announcing peer may be sent leeches in its peer list.
+///
+/// The tracker only controls who learns which addresses. It can't control
+/// which connections a client accepts, and once two clients are connected
+/// it doesn't matter who dialed: pieces flow both ways. So a capped peer
+/// that is withheld from everyone else's list, but still receives leeches
+/// in its own, connects to those leeches and keeps uploading. Within one
+/// announce interval it reaches every leech it was withheld from.
+///
+/// `peers` must be the same filtered peers the lists are built from, so the
+/// fallback check below sees the same swarm as `choose_peers`.
+///
+/// The announcer's role is passed as a `PeerKind` rather than a third bool,
+/// in the same position as in `choose_peers`, so it can't be swapped with
+/// one of the flags by mistake. The two remaining flags are only ever
+/// combined with `&&`, so swapping those wouldn't change the result.
+fn receives_leech_list<'a>(
+    mut peers: impl Iterator<Item = (&'a peer::Index, &'a Peer)>,
+    announcer_kind: PeerKind,
+    withholds_capped_peers: bool,
+    announcer_is_capped: bool,
+) -> bool {
+    // Uncapped peers, and all peers on torrents that don't withhold, get
+    // leeches exactly as before this feature.
+    if !(withholds_capped_peers && announcer_is_capped) {
+        return true;
+    }
+
+    // A capped leech gets no leeches, without exception. It still gets
+    // seeds, so it can finish its download. Leech lists have no fallback in
+    // `choose_peers` either.
+    if announcer_kind == PeerKind::Leech {
+        return false;
+    }
+
+    // A capped seed gets no leeches while an uncapped seed is available.
+    //
+    // If none is, `choose_peers` hands the capped seeds out to leeches
+    // anyway, so they aren't left without a source. Withholding the leeches
+    // from the capped seed would then protect nothing, but would cut off
+    // seeds that can't accept incoming connections: those can only reach
+    // leeches by dialing out. So the capped seed keeps its leech list then.
+    //
+    // The scan stops at the first uncapped seed and only runs for capped
+    // seeds, so uncapped announces cost nothing extra. Excluding the
+    // announcer's own user from `peers` doesn't change the result, since all
+    // clients of one user share the same cap state.
+    !peers.any(|(_, peer)| peer.is_seeder && !peer.is_upload_capped)
+}
+
+#[cfg(test)]
+mod tests {
+    //! Tests for `choose_peers`, which builds the seed and leech parts of
+    //! the peer list while leaving out peers of capped users.
+    //!
+    //! Swarms are built from `(user_id, is_seeder, is_upload_capped)`
+    //! tuples. Selection is random, so the tests use `numwant` values that
+    //! are either larger than the swarm (the result is deterministic) or
+    //! only check the count and which peers are excluded.
+
+    use super::*;
+
+    use crate::store::peer::PeerStore;
+
+    /// Builds an active, visible, connectable peer.
+    fn make_peer(is_seeder: bool, is_upload_capped: bool) -> Peer {
+        Peer {
+            ip_address: IpAddr::from([127, 0, 0, 1]),
+            port: 6881,
+            is_seeder,
+            is_active: true,
+            is_visible: true,
+            is_connectable: true,
+            has_sent_completed: false,
+            updated_at: Utc::now(),
+            uploaded: 0,
+            downloaded: 0,
+            is_upload_capped,
+        }
+    }
+
+    /// Builds a swarm where every user has one peer. `user_id` doubles as
+    /// the peer id byte so chosen peers can be identified.
+    fn swarm(peers: &[(u32, bool, bool)]) -> PeerStore {
+        let mut store = PeerStore::new();
+
+        for &(user_id, is_seeder, is_upload_capped) in peers {
+            store.insert(
+                peer::Index {
+                    user_id,
+                    peer_id: PeerId([user_id as u8; 20]),
+                },
+                make_peer(is_seeder, is_upload_capped),
+            );
+        }
+
+        store
+    }
+
+    /// Returns the sorted user ids of the chosen peers, so results can be
+    /// compared regardless of the random order.
+    fn chosen_user_ids(chosen: &[(&peer::Index, &Peer)]) -> Vec<u32> {
+        let mut user_ids: Vec<u32> = chosen.iter().map(|(index, _)| index.user_id).collect();
+        user_ids.sort_unstable();
+        user_ids
+    }
+
+    /// The core requirement: a capped seed is left out even when the leech
+    /// asked for far more peers than the swarm has.
+    #[test]
+    fn choose_peers_withholds_capped_seeds_even_with_room() {
+        let peers = swarm(&[(1, true, false), (2, true, true), (3, true, false)]);
+
+        let chosen = choose_peers(peers.iter(), PeerKind::Seed, true, 50);
+
+        assert_eq!(
+            chosen_user_ids(&chosen),
+            vec![1, 3],
+            "only the uncapped seeds must be chosen, despite numwant 50"
+        );
+    }
+
+    /// On torrents without upload cap, stale cap flags must have no
+    /// effect and every seed is handed out as before this feature.
+    #[test]
+    fn choose_peers_ignores_cap_when_torrent_does_not_withhold() {
+        let peers = swarm(&[(1, true, false), (2, true, true)]);
+
+        let chosen = choose_peers(peers.iter(), PeerKind::Seed, false, 50);
+
+        assert_eq!(
+            chosen_user_ids(&chosen),
+            vec![1, 2],
+            "all seeds must be chosen when the torrent doesn't withhold"
+        );
+    }
+
+    /// If every seed is capped, withholding them would leave the leech
+    /// without any source and the torrent would be dead. The capped seeds
+    /// are handed out instead. The leech in the swarm must not be mixed in.
+    #[test]
+    fn choose_peers_falls_back_to_capped_seeds_when_all_are_capped() {
+        let peers = swarm(&[(1, true, true), (2, true, true), (3, false, false)]);
+
+        let chosen = choose_peers(peers.iter(), PeerKind::Seed, true, 50);
+
+        assert_eq!(
+            chosen_user_ids(&chosen),
+            vec![1, 2],
+            "all capped seeds must be chosen when no uncapped seed exists"
+        );
+    }
+
+    /// Leech lists have no fallback: a leech without other leeches still
+    /// gets seeds, and seeds find the capped leeches when those announce.
+    #[test]
+    fn choose_peers_does_not_fall_back_for_leeches() {
+        let peers = swarm(&[(1, false, true), (2, false, true), (3, true, false)]);
+
+        let chosen = choose_peers(peers.iter(), PeerKind::Leech, true, 50);
+
+        assert!(
+            chosen.is_empty(),
+            "capped leeches must stay withheld even if none are left"
+        );
+    }
+
+    /// The cap applies to leeches too, not only to seeds.
+    #[test]
+    fn choose_peers_withholds_capped_leeches() {
+        let peers = swarm(&[(1, false, false), (2, false, true), (3, true, false)]);
+
+        let chosen = choose_peers(peers.iter(), PeerKind::Leech, true, 50);
+
+        assert_eq!(
+            chosen_user_ids(&chosen),
+            vec![1],
+            "only the uncapped leech must be chosen"
+        );
+    }
+
+    /// Seed and leech lists are built separately, so each call must only
+    /// return the requested kind of peer.
+    #[test]
+    fn choose_peers_only_returns_requested_kind() {
+        let peers = swarm(&[(1, true, false), (2, false, false)]);
+
+        assert_eq!(
+            chosen_user_ids(&choose_peers(peers.iter(), PeerKind::Seed, true, 50)),
+            vec![1],
+            "a seed list must contain only seeds"
+        );
+        assert_eq!(
+            chosen_user_ids(&choose_peers(peers.iter(), PeerKind::Leech, true, 50)),
+            vec![2],
+            "a leech list must contain only leeches"
+        );
+    }
+
+    /// With more uncapped seeds than requested, exactly `amount` are
+    /// chosen, and the capped one is never among them.
+    #[test]
+    fn choose_peers_respects_amount() {
+        let peers = swarm(&[
+            (1, true, false),
+            (2, true, false),
+            (3, true, false),
+            (4, true, true),
+        ]);
+
+        let chosen = choose_peers(peers.iter(), PeerKind::Seed, true, 2);
+
+        assert_eq!(chosen.len(), 2, "exactly 2 seeds must be chosen");
+        assert!(
+            chosen.iter().all(|(index, _)| index.user_id != 4),
+            "the capped seed must never be chosen"
+        );
+    }
+
+    /// The fallback path must also stop at `amount`, so a large swarm of
+    /// capped seeds doesn't blow up the response.
+    #[test]
+    fn choose_peers_fallback_respects_amount() {
+        let peers = swarm(&[(1, true, true), (2, true, true), (3, true, true)]);
+
+        let chosen = choose_peers(peers.iter(), PeerKind::Seed, true, 2);
+
+        assert_eq!(
+            chosen.len(),
+            2,
+            "the fallback must choose exactly 2 of the 3 capped seeds"
+        );
+    }
+
+    /// An empty swarm must return an empty list on both the normal and the
+    /// fallback path, without panicking.
+    #[test]
+    fn choose_peers_empty_swarm() {
+        let peers = swarm(&[]);
+
+        assert!(
+            choose_peers(peers.iter(), PeerKind::Seed, true, 50).is_empty(),
+            "an empty swarm must give an empty peer list"
+        );
+    }
+
+    // Tests for `receives_leech_list`, which keeps capped peers from
+    // learning about leeches and connecting to them themselves.
+    //
+    // Argument order after the swarm: announcer_kind,
+    // withholds_capped_peers, announcer_is_capped.
+
+    /// Uncapped peers are unaffected, whether they seed or leech.
+    #[test]
+    fn receives_leech_list_for_uncapped_announcer() {
+        let peers = swarm(&[(1, true, false), (2, false, false)]);
+
+        assert!(
+            receives_leech_list(peers.iter(), PeerKind::Seed, true, false),
+            "an uncapped seed must get leeches"
+        );
+        assert!(
+            receives_leech_list(peers.iter(), PeerKind::Leech, true, false),
+            "an uncapped leech must get leeches"
+        );
+    }
+
+    /// On torrents without upload cap, stale cap flags must have no effect.
+    #[test]
+    fn receives_leech_list_when_torrent_does_not_withhold() {
+        let peers = swarm(&[(1, true, false), (2, false, false)]);
+
+        assert!(
+            receives_leech_list(peers.iter(), PeerKind::Seed, false, true),
+            "a capped seed must get leeches when the torrent doesn't withhold"
+        );
+        assert!(
+            receives_leech_list(peers.iter(), PeerKind::Leech, false, true),
+            "a capped leech must get leeches when the torrent doesn't withhold"
+        );
+    }
+
+    /// The core fix: a capped seed must not learn the leeches' addresses
+    /// while another seed can serve them.
+    #[test]
+    fn receives_leech_list_withheld_from_capped_seed() {
+        let peers = swarm(&[(1, true, false), (2, false, false)]);
+
+        assert!(
+            !receives_leech_list(peers.iter(), PeerKind::Seed, true, true),
+            "a capped seed must get no leeches while an uncapped seed exists"
+        );
+    }
+
+    /// A capped leech never gets leeches, even if every seed is capped.
+    /// Leech lists have no fallback.
+    #[test]
+    fn receives_leech_list_withheld_from_capped_leech() {
+        let only_capped_seeds = swarm(&[(1, true, true), (2, false, false)]);
+        let with_uncapped_seed = swarm(&[(1, true, false), (2, false, false)]);
+
+        assert!(
+            !receives_leech_list(only_capped_seeds.iter(), PeerKind::Leech, true, true),
+            "a capped leech must get no leeches, even without uncapped seeds"
+        );
+        assert!(
+            !receives_leech_list(with_uncapped_seed.iter(), PeerKind::Leech, true, true),
+            "a capped leech must get no leeches"
+        );
+    }
+
+    /// Mirrors the seed fallback in `choose_peers`: once leeches are handed
+    /// the capped seeds anyway, the capped seeds may reach them too.
+    #[test]
+    fn receives_leech_list_for_capped_seed_when_all_seeds_are_capped() {
+        let peers = swarm(&[(1, true, true), (2, true, true), (3, false, false)]);
+
+        assert!(
+            receives_leech_list(peers.iter(), PeerKind::Seed, true, true),
+            "a capped seed must get leeches when no uncapped seed exists"
+        );
+    }
+
+    /// Uncapped leeches are not seeds, so they must not count as a source
+    /// that would let the capped seed's leech list be withheld.
+    #[test]
+    fn receives_leech_list_ignores_uncapped_leeches_in_fallback_check() {
+        let peers = swarm(&[(1, true, true), (2, false, false), (3, false, false)]);
+
+        assert!(
+            receives_leech_list(peers.iter(), PeerKind::Seed, true, true),
+            "uncapped leeches must not count as an uncapped seed"
+        );
+    }
+
+    /// A capped seed alone in the swarm keeps its (empty) leech list. There
+    /// is nothing to withhold, and nothing must panic.
+    #[test]
+    fn receives_leech_list_empty_swarm() {
+        let peers = swarm(&[]);
+
+        assert!(
+            receives_leech_list(peers.iter(), PeerKind::Seed, true, true),
+            "a capped seed in an empty swarm must not be blocked"
+        );
+    }
 }
