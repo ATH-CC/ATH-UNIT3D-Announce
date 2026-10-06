@@ -76,8 +76,10 @@ pub struct Config {
     pub max_peers_per_torrent_per_user: u16,
     /// On torrents with upload cap enabled, a user's peers are withheld
     /// from peer lists once their total upload on the torrent reaches this
-    /// percentage of the torrent size. 500 means 5x the torrent size. 0
-    /// disables withholding.
+    /// percentage of the torrent size. 100 means 1x (a 1.0 ratio), 500 means
+    /// 5x the torrent size. Upload past this point is still recorded as
+    /// actual upload, but no longer credited. 0 disables both withholding
+    /// and the credit limit.
     pub upload_cap_threshold: u64,
     /// Open a connection to the incoming peer announcing and record if their
     /// socket accepts the connection.

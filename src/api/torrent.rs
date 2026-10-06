@@ -234,4 +234,15 @@ mod tests {
         ));
         assert!(select_upload_totals(false, totals(1, 7), None).is_empty());
     }
+
+    /// Negative side of loading totals: a torrent that is added or updated
+    /// without upload cap must not query `history` at all.
+    #[test]
+    fn does_not_load_totals_without_upload_cap() {
+        assert!(!needs_upload_totals_load(false, None));
+        assert!(!needs_upload_totals_load(
+            false,
+            Some(&torrent_with_upload_cap(false))
+        ));
+    }
 }

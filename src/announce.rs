@@ -51,6 +51,7 @@ use crate::store::{
     freeleech_token::FreeleechToken,
     peer::{self, Peer},
     personal_freeleech::PersonalFreeleech,
+    torrent::RecordedUpload,
 };
 use crate::utils;
 
@@ -378,6 +379,7 @@ pub async fn announce(
         upload_factor,
         download_factor,
         uploaded_delta,
+        creditable_uploaded_delta,
         downloaded_delta,
         seeder_delta,
         leecher_delta,
@@ -617,7 +619,15 @@ pub async fn announce(
         // It also decides below whether this peer may be sent leeches.
         // Recording the upload first means a peer that crosses the threshold
         // with this announce already gets no leeches in this response.
-        let is_upload_capped = torrent.record_upload(
+        //
+        // Upload past the cap is still recorded in full (`actual_uploaded`,
+        // `client_uploaded` and the torrent balance), but only the creditable
+        // part counts towards the credited upload in `history.uploaded` and
+        // `users.uploaded`.
+        let RecordedUpload {
+            is_upload_capped,
+            creditable_delta: creditable_uploaded_delta,
+        } = torrent.record_upload(
             user_id,
             queries.peer_id,
             uploaded_delta,
@@ -837,6 +847,7 @@ pub async fn announce(
             upload_factor,
             download_factor,
             uploaded_delta,
+            creditable_uploaded_delta,
             downloaded_delta,
             seeder_delta,
             leecher_delta,
@@ -888,8 +899,10 @@ pub async fn announce(
         upload_factor
     };
 
-    let credited_uploaded_delta = upload_factor as u64 * uploaded_delta / 100;
-    let credited_downloaded_delta = download_factor as u64 * downloaded_delta / 100;
+    // Factors are applied after the upload cap, so double upload doubles the
+    // allowance left below the cap but never credits upload past it.
+    let credited_uploaded_delta = apply_factor(creditable_uploaded_delta, upload_factor);
+    let credited_downloaded_delta = apply_factor(downloaded_delta, download_factor);
 
     let completed_at = if queries.event == Event::Completed {
         Some(now)
@@ -1069,6 +1082,16 @@ async fn check_connectivity(state: &Arc<AppState>, ip: IpAddr, port: u16) -> boo
     }
 
     false
+}
+
+/// Scales a raw byte delta by a percentage factor, e.g. 200 for double
+/// upload or 0 for freeleech, rounding down.
+///
+/// Computed in `u128` and saturated, so an absurd client-reported delta
+/// can't overflow (a panic in debug builds, a wrap in release builds).
+#[inline]
+fn apply_factor(delta: u64, factor_percent: u8) -> u64 {
+    u64::try_from(delta as u128 * factor_percent as u128 / 100).unwrap_or(u64::MAX)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1449,5 +1472,63 @@ mod tests {
             receives_leech_list(peers.iter(), PeerKind::Seed, true, true),
             "a capped seed in an empty swarm must not be blocked"
         );
+    }
+
+    // Tests for `apply_factor` and how it composes with the upload cap.
+
+    /// Factors are percentages: 100 is unchanged, 200 doubles, 0 drops the
+    /// delta (freeleech), 50 halves it rounding down.
+    #[test]
+    fn apply_factor_scales_by_percentage() {
+        assert_eq!(apply_factor(1_000, 100), 1_000);
+        assert_eq!(apply_factor(1_000, 200), 2_000);
+        assert_eq!(apply_factor(1_000, 0), 0);
+        assert_eq!(apply_factor(3, 50), 1);
+    }
+
+    /// A delta near `u64::MAX` must saturate instead of overflowing.
+    #[test]
+    fn apply_factor_saturates() {
+        assert_eq!(apply_factor(u64::MAX, 200), u64::MAX);
+        assert_eq!(apply_factor(u64::MAX, 100), u64::MAX);
+    }
+
+    /// The crossing announce on a double upload torrent: 2 bytes were left
+    /// below the cap, so 4 bytes are credited, not twice the full delta.
+    #[test]
+    fn upload_factor_applies_to_creditable_part_only() {
+        use crate::store::upload_total::creditable_upload;
+
+        let creditable = creditable_upload(98, 10, 100, 100);
+
+        assert_eq!(creditable, 2);
+        assert_eq!(apply_factor(creditable, 200), 4);
+    }
+
+    /// The example from the feature description: 9 GiB uploaded, 3 GiB
+    /// announced on a 10 GiB double upload torrent. Only the 1 GiB below the
+    /// cap is doubled, so 2 GiB are credited, not 6 GiB.
+    #[test]
+    fn upload_factor_doubles_only_the_part_below_the_cap() {
+        use crate::store::upload_total::creditable_upload;
+
+        const GIB: u64 = 1 << 30;
+
+        let creditable = creditable_upload(9 * GIB, 3 * GIB, 10 * GIB, 100);
+
+        assert_eq!(apply_factor(creditable, 200), 2 * GIB);
+    }
+
+    /// Negative side: below the cap, double upload doubles the whole
+    /// announce, exactly as without upload cap.
+    #[test]
+    fn upload_factor_doubles_everything_below_the_cap() {
+        use crate::store::upload_total::creditable_upload;
+
+        const GIB: u64 = 1 << 30;
+
+        let creditable = creditable_upload(GIB, 3 * GIB, 10 * GIB, 100);
+
+        assert_eq!(apply_factor(creditable, 200), 6 * GIB);
     }
 }

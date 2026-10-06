@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 
 use crate::model::{peer_id::PeerId, torrent_status::TorrentStatus};
 use crate::store::peer::{Index, Peer, PeerStore};
-use crate::store::upload_total::{UploadTotalStore, is_over_upload_cap};
+use crate::store::upload_total::{UploadTotalStore, creditable_upload, is_over_upload_cap};
 
 pub struct TorrentStore {
     inner: IndexMap<u32, Torrent>,
@@ -219,7 +219,8 @@ pub struct Torrent {
     pub size: u64,
     /// When enabled, peers of users whose total upload on this torrent
     /// reaches `upload_cap_threshold` percent of the torrent size are
-    /// withheld from peer lists.
+    /// withheld from peer lists, and their upload past that point is
+    /// recorded but no longer credited.
     pub upload_cap: bool,
     #[serde(skip)]
     pub upload_totals: UploadTotalStore,
@@ -240,28 +241,57 @@ impl Torrent {
     }
 
     /// Adds `uploaded_delta` to the user's total upload on this torrent and
-    /// refreshes the cached cap flag of their peers. Returns whether the
-    /// user is capped afterwards, or false if upload cap is disabled.
+    /// refreshes the cached cap flag of their peers.
+    ///
+    /// The total always grows by the full delta, so it keeps mirroring
+    /// `history.actual_uploaded` after the cap is reached. Only the returned
+    /// [`RecordedUpload::creditable_delta`] is limited by the cap.
+    ///
+    /// Without upload cap on this torrent, nothing is stored, the user is
+    /// never capped and the whole delta is creditable.
     pub fn record_upload(
         &mut self,
         user_id: u32,
         peer_id: PeerId,
         uploaded_delta: u64,
         threshold_percent: u64,
-    ) -> bool {
+    ) -> RecordedUpload {
         if !self.upload_cap {
-            return false;
+            return RecordedUpload {
+                is_upload_capped: false,
+                creditable_delta: uploaded_delta,
+            };
         }
 
-        let previous_total = self.upload_totals.get(&user_id).copied().unwrap_or(0);
+        // One hash lookup for the read and the write. Announces without
+        // upload (most leech announces) only read, so they never insert a
+        // 0 entry.
+        let previous_total = if uploaded_delta > 0 {
+            let stored_total = self.upload_totals.entry(user_id).or_insert(0);
+            let previous_total = *stored_total;
+            *stored_total = previous_total.saturating_add(uploaded_delta);
+
+            previous_total
+        } else {
+            self.upload_totals.get(&user_id).copied().unwrap_or(0)
+        };
         let total = previous_total.saturating_add(uploaded_delta);
-
-        if uploaded_delta > 0 {
-            self.upload_totals.insert(user_id, total);
-        }
 
         let was_capped = is_over_upload_cap(previous_total, self.size, threshold_percent);
         let is_capped = is_over_upload_cap(total, self.size, threshold_percent);
+
+        // This runs inside the global torrent lock on every announce, so the
+        // two checks above settle the common cases without the division in
+        // `creditable_upload`: still below the cap after this announce means
+        // everything is creditable, already capped before it means nothing
+        // is. Only the single announce that crosses the cap needs the split.
+        let creditable_delta = if !is_capped {
+            uploaded_delta
+        } else if was_capped {
+            0
+        } else {
+            creditable_upload(previous_total, uploaded_delta, self.size, threshold_percent)
+        };
         let announcing_peer_is_stale = self
             .peers
             .get(&Index { user_id, peer_id })
@@ -277,8 +307,24 @@ impl Torrent {
             }
         }
 
-        is_capped
+        RecordedUpload {
+            is_upload_capped: is_capped,
+            creditable_delta,
+        }
     }
+}
+
+/// What [`Torrent::record_upload`] decided about one announce's upload.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[must_use]
+pub struct RecordedUpload {
+    /// Whether the user is over the upload cap after this announce. Always
+    /// false on torrents without upload cap.
+    pub is_upload_capped: bool,
+    /// The part of the announce's upload, in raw bytes before upload factors,
+    /// that may still be credited to the user. The rest is recorded as actual
+    /// upload only.
+    pub creditable_delta: u64,
 }
 
 #[cfg(test)]
@@ -344,8 +390,8 @@ mod tests {
         let mut torrent = upload_capped_torrent();
         torrent.peers.insert(index(1, 1), make_peer(false));
 
-        torrent.record_upload(1, PeerId([1; 20]), 3 * GIB, 500);
-        torrent.record_upload(1, PeerId([1; 20]), 4 * GIB, 500);
+        let _ = torrent.record_upload(1, PeerId([1; 20]), 3 * GIB, 500);
+        let _ = torrent.record_upload(1, PeerId([1; 20]), 4 * GIB, 500);
 
         assert_eq!(
             torrent.upload_totals.get(&1),
@@ -362,7 +408,9 @@ mod tests {
         torrent.upload_cap = false;
         torrent.peers.insert(index(1, 1), make_peer(false));
 
-        let capped = torrent.record_upload(1, PeerId([1; 20]), 100 * GIB, 500);
+        let capped = torrent
+            .record_upload(1, PeerId([1; 20]), 100 * GIB, 500)
+            .is_upload_capped;
 
         assert!(!capped, "the user must not be reported as capped");
         assert!(
@@ -382,7 +430,7 @@ mod tests {
         let mut torrent = upload_capped_torrent();
         torrent.peers.insert(index(1, 1), make_peer(false));
 
-        torrent.record_upload(1, PeerId([1; 20]), 0, 500);
+        let _ = torrent.record_upload(1, PeerId([1; 20]), 0, 500);
 
         assert!(
             torrent.upload_totals.is_empty(),
@@ -396,7 +444,9 @@ mod tests {
         let mut torrent = upload_capped_torrent();
         torrent.peers.insert(index(1, 1), make_peer(false));
 
-        let capped = torrent.record_upload(1, PeerId([1; 20]), 49 * GIB, 500);
+        let capped = torrent
+            .record_upload(1, PeerId([1; 20]), 49 * GIB, 500)
+            .is_upload_capped;
 
         assert!(!capped, "490% must not reach a 500% threshold");
         assert!(
@@ -415,8 +465,10 @@ mod tests {
         torrent.peers.insert(index(1, 2), make_peer(false));
         torrent.peers.insert(index(2, 3), make_peer(false));
 
-        torrent.record_upload(1, PeerId([1; 20]), 49 * GIB, 500);
-        let capped = torrent.record_upload(1, PeerId([1; 20]), GIB, 500);
+        let _ = torrent.record_upload(1, PeerId([1; 20]), 49 * GIB, 500);
+        let capped = torrent
+            .record_upload(1, PeerId([1; 20]), GIB, 500)
+            .is_upload_capped;
 
         assert!(capped, "50 GiB must reach the 500% threshold");
         assert!(
@@ -442,7 +494,9 @@ mod tests {
         torrent.upload_totals.insert(1, 60 * GIB);
         torrent.peers.insert(index(1, 1), make_peer(false));
 
-        let capped = torrent.record_upload(1, PeerId([1; 20]), 0, 500);
+        let capped = torrent
+            .record_upload(1, PeerId([1; 20]), 0, 500)
+            .is_upload_capped;
 
         assert!(capped, "a 60 GiB total from history must reach 500%");
         assert!(
@@ -460,7 +514,9 @@ mod tests {
         torrent.upload_totals.insert(1, 60 * GIB);
         torrent.peers.insert(index(1, 1), make_peer(true));
 
-        let capped = torrent.record_upload(1, PeerId([1; 20]), 0, 1000);
+        let capped = torrent
+            .record_upload(1, PeerId([1; 20]), 0, 1000)
+            .is_upload_capped;
 
         assert!(!capped, "600% must not reach a 1000% threshold");
         assert!(
@@ -478,7 +534,7 @@ mod tests {
         torrent.peers.insert(index(1, 1), make_peer(true));
         torrent.peers.insert(index(1, 2), make_peer(true));
 
-        torrent.record_upload(1, PeerId([1; 20]), 0, 1000);
+        let _ = torrent.record_upload(1, PeerId([1; 20]), 0, 1000);
 
         assert!(!is_capped(&torrent, index(1, 2)));
     }
@@ -492,7 +548,9 @@ mod tests {
         torrent.size = 0;
         torrent.peers.insert(index(1, 1), make_peer(false));
 
-        let capped = torrent.record_upload(1, PeerId([1; 20]), 100 * GIB, 500);
+        let capped = torrent
+            .record_upload(1, PeerId([1; 20]), 100 * GIB, 500)
+            .is_upload_capped;
 
         assert!(!capped, "a torrent without size must not cap anyone");
         assert_eq!(
@@ -522,7 +580,9 @@ mod tests {
         torrent.peers.insert(index(1, 1), seed);
         torrent.peers.insert(index(1, 2), seed);
 
-        let capped = torrent.record_upload(1, PeerId([1; 20]), 60 * GIB, 500);
+        let capped = torrent
+            .record_upload(1, PeerId([1; 20]), 60 * GIB, 500)
+            .is_upload_capped;
 
         assert!(capped, "60 GiB must reach the 500% threshold");
 
@@ -556,7 +616,9 @@ mod tests {
     fn record_upload_for_stopped_peer_still_updates_total() {
         let mut torrent = upload_capped_torrent();
 
-        let capped = torrent.record_upload(1, PeerId([1; 20]), 60 * GIB, 500);
+        let capped = torrent
+            .record_upload(1, PeerId([1; 20]), 60 * GIB, 500)
+            .is_upload_capped;
 
         assert!(capped, "60 GiB must reach the 500% threshold");
         assert_eq!(
@@ -606,6 +668,362 @@ mod tests {
         assert!(
             !is_capped(&torrent, index(1, 1)),
             "a threshold of 0 must clear the cap flag"
+        );
+    }
+
+    // Tests for the credit side of `record_upload`: upload past the cap is
+    // still recorded in the user's total, but no longer creditable.
+    //
+    // These use a 100% (1.0) threshold, so the cap on the 10 GiB torrent is
+    // reached at 10 GiB of total upload.
+
+    /// Below the cap, the whole delta is creditable.
+    #[test]
+    fn record_upload_credits_everything_below_cap() {
+        let mut torrent = upload_capped_torrent();
+
+        let recorded = torrent.record_upload(1, PeerId([1; 20]), 4 * GIB, 100);
+
+        assert_eq!(
+            recorded,
+            RecordedUpload {
+                is_upload_capped: false,
+                creditable_delta: 4 * GIB,
+            }
+        );
+    }
+
+    /// The announce that crosses the cap is credited only up to the cap, but
+    /// its full delta is added to the total.
+    #[test]
+    fn record_upload_credits_only_up_to_cap_when_crossing() {
+        let mut torrent = upload_capped_torrent();
+        let _ = torrent.record_upload(1, PeerId([1; 20]), 8 * GIB, 100);
+
+        let recorded = torrent.record_upload(1, PeerId([1; 20]), 5 * GIB, 100);
+
+        assert!(recorded.is_upload_capped, "13 GiB must reach the 1.0 cap");
+        assert_eq!(
+            recorded.creditable_delta,
+            2 * GIB,
+            "only the 2 GiB below the cap may be credited"
+        );
+        assert_eq!(
+            torrent.upload_totals.get(&1),
+            Some(&(13 * GIB)),
+            "the full upload must still be recorded"
+        );
+    }
+
+    /// Once capped, further upload is recorded but not creditable.
+    #[test]
+    fn record_upload_records_but_does_not_credit_after_cap() {
+        let mut torrent = upload_capped_torrent();
+        let _ = torrent.record_upload(1, PeerId([1; 20]), 10 * GIB, 100);
+
+        let recorded = torrent.record_upload(1, PeerId([1; 20]), 3 * GIB, 100);
+
+        assert!(recorded.is_upload_capped);
+        assert_eq!(
+            recorded.creditable_delta, 0,
+            "nothing past the cap may be credited"
+        );
+        assert_eq!(
+            torrent.upload_totals.get(&1),
+            Some(&(13 * GIB)),
+            "upload past the cap must still be recorded"
+        );
+    }
+
+    /// A user already over the cap from earlier sessions, loaded from
+    /// `history`, gets no credit from their first announce on.
+    #[test]
+    fn record_upload_does_not_credit_user_capped_by_history() {
+        let mut torrent = upload_capped_torrent();
+        torrent.upload_totals.insert(1, 12 * GIB);
+
+        let recorded = torrent.record_upload(1, PeerId([1; 20]), GIB, 100);
+
+        assert_eq!(recorded.creditable_delta, 0);
+        assert_eq!(torrent.upload_totals.get(&1), Some(&(13 * GIB)));
+    }
+
+    /// The cap is per user, not per client: a second client of a capped
+    /// user isn't credited either, even if it never uploaded before.
+    #[test]
+    fn record_upload_shares_cap_between_clients_of_user() {
+        let mut torrent = upload_capped_torrent();
+        torrent.peers.insert(index(1, 1), make_peer(false));
+        torrent.peers.insert(index(1, 2), make_peer(false));
+        let _ = torrent.record_upload(1, PeerId([1; 20]), 10 * GIB, 100);
+
+        let recorded = torrent.record_upload(1, PeerId([2; 20]), GIB, 100);
+
+        assert_eq!(
+            recorded.creditable_delta, 0,
+            "the user's other client must not be credited past the cap"
+        );
+    }
+
+    /// One user reaching the cap must not affect anyone else's credit.
+    #[test]
+    fn record_upload_cap_does_not_affect_other_users() {
+        let mut torrent = upload_capped_torrent();
+        let _ = torrent.record_upload(1, PeerId([1; 20]), 20 * GIB, 100);
+
+        let recorded = torrent.record_upload(2, PeerId([2; 20]), 3 * GIB, 100);
+
+        assert_eq!(recorded.creditable_delta, 3 * GIB);
+    }
+
+    /// Without upload cap on the torrent, everything is credited, however
+    /// much was uploaded. This is also the state after staff disable the
+    /// flag: the totals are dropped and credit resumes.
+    #[test]
+    fn record_upload_credits_everything_without_upload_cap() {
+        let mut torrent = upload_capped_torrent();
+        torrent.upload_cap = false;
+
+        let recorded = torrent.record_upload(1, PeerId([1; 20]), 100 * GIB, 100);
+
+        assert_eq!(
+            recorded,
+            RecordedUpload {
+                is_upload_capped: false,
+                creditable_delta: 100 * GIB,
+            }
+        );
+    }
+
+    /// `UPLOAD_CAP_THRESHOLD=0` disables the cap, for credit as well as for
+    /// peer lists.
+    #[test]
+    fn record_upload_credits_everything_with_zero_threshold() {
+        let mut torrent = upload_capped_torrent();
+
+        let recorded = torrent.record_upload(1, PeerId([1; 20]), 100 * GIB, 0);
+
+        assert_eq!(recorded.creditable_delta, 100 * GIB);
+        assert_eq!(
+            torrent.upload_totals.get(&1),
+            Some(&(100 * GIB)),
+            "totals must still be tracked, so a later threshold applies correctly"
+        );
+    }
+
+    /// A torrent without a known size never caps, so it must credit
+    /// everything too.
+    #[test]
+    fn record_upload_credits_everything_without_size() {
+        let mut torrent = upload_capped_torrent();
+        torrent.size = 0;
+
+        let recorded = torrent.record_upload(1, PeerId([1; 20]), 100 * GIB, 100);
+
+        assert_eq!(recorded.creditable_delta, 100 * GIB);
+    }
+
+    /// Raising the threshold by a config reload lets users below the new cap
+    /// earn credit again, up to the new cap.
+    #[test]
+    fn record_upload_credits_again_after_threshold_is_raised() {
+        let mut torrent = upload_capped_torrent();
+        let _ = torrent.record_upload(1, PeerId([1; 20]), 12 * GIB, 100);
+
+        let recorded = torrent.record_upload(1, PeerId([1; 20]), 10 * GIB, 200);
+
+        assert!(
+            recorded.is_upload_capped,
+            "22 GiB must reach the raised cap of 20 GiB"
+        );
+        assert_eq!(
+            recorded.creditable_delta,
+            8 * GIB,
+            "credit must resume up to the raised cap of 20 GiB"
+        );
+    }
+
+    /// The stopped event removes the peer before its last upload is
+    /// recorded. That upload must be capped like any other.
+    #[test]
+    fn record_upload_caps_credit_for_stopped_peer() {
+        let mut torrent = upload_capped_torrent();
+        let _ = torrent.record_upload(1, PeerId([1; 20]), 9 * GIB, 100);
+
+        let recorded = torrent.record_upload(1, PeerId([1; 20]), 4 * GIB, 100);
+
+        assert_eq!(recorded.creditable_delta, GIB);
+        assert!(torrent.peers.is_empty(), "the test needs a peer-less swarm");
+    }
+
+    /// `record_upload` skips `creditable_upload` unless the announce crosses
+    /// the cap. Over a grid of small values, including thresholds that don't
+    /// divide the size evenly, the shortcut must give exactly the same credit
+    /// and the same total as calling it every time.
+    #[test]
+    fn record_upload_shortcut_matches_creditable_upload() {
+        for size in 1..=7 {
+            for threshold_percent in [0, 1, 33, 50, 100, 101, 250] {
+                for previous_total in 0..=20 {
+                    for uploaded_delta in 0..=20 {
+                        let mut torrent = Torrent {
+                            size,
+                            upload_cap: true,
+                            ..Default::default()
+                        };
+
+                        if previous_total > 0 {
+                            torrent.upload_totals.insert(1, previous_total);
+                        }
+
+                        let recorded = torrent.record_upload(
+                            1,
+                            PeerId([1; 20]),
+                            uploaded_delta,
+                            threshold_percent,
+                        );
+
+                        assert_eq!(
+                            recorded.creditable_delta,
+                            creditable_upload(
+                                previous_total,
+                                uploaded_delta,
+                                size,
+                                threshold_percent
+                            ),
+                            "size {size}, threshold {threshold_percent}, previous \
+                             {previous_total}, delta {uploaded_delta}"
+                        );
+                        assert_eq!(
+                            torrent.upload_totals.get(&1).copied().unwrap_or(0),
+                            previous_total + uploaded_delta
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    // One test per behaviour rule that wasn't covered from both sides yet.
+
+    /// Shared total, positive side: the uploads of all clients of a user add
+    /// up. The first client's 6 GiB are credited in full, the second
+    /// client's 6 GiB only up to the 10 GiB cap.
+    #[test]
+    fn record_upload_adds_up_uploads_of_all_clients_of_user() {
+        let mut torrent = upload_capped_torrent();
+
+        let first = torrent.record_upload(1, PeerId([1; 20]), 6 * GIB, 100);
+        let second = torrent.record_upload(1, PeerId([2; 20]), 6 * GIB, 100);
+
+        assert_eq!(
+            first.creditable_delta,
+            6 * GIB,
+            "the first client is still below the cap"
+        );
+        assert_eq!(
+            second.creditable_delta,
+            4 * GIB,
+            "the second client must only get what's left of the user's cap"
+        );
+    }
+
+    /// Per torrent, negative side: being capped on one torrent must not
+    /// limit credit on another. Every torrent keeps its own totals.
+    #[test]
+    fn record_upload_cap_is_per_torrent() {
+        let mut capped_on = upload_capped_torrent();
+        let mut other = upload_capped_torrent();
+        let _ = capped_on.record_upload(1, PeerId([1; 20]), 20 * GIB, 100);
+
+        let recorded = other.record_upload(1, PeerId([1; 20]), 3 * GIB, 100);
+
+        assert_eq!(
+            recorded.creditable_delta,
+            3 * GIB,
+            "a cap on another torrent must not limit credit here"
+        );
+        assert_eq!(
+            capped_on
+                .record_upload(1, PeerId([1; 20]), GIB, 100)
+                .creditable_delta,
+            0,
+            "the user must stay capped on the first torrent"
+        );
+    }
+
+    /// Earlier sessions, negative side: a total from `history` below the cap
+    /// doesn't block credit, it only uses up part of the allowance. This is
+    /// the example from the feature description: 9 GiB from history plus a
+    /// 3 GiB announce on a 10 GiB torrent credits 1 GiB and records 3 GiB.
+    #[test]
+    fn record_upload_credits_rest_of_cap_after_earlier_sessions() {
+        let mut torrent = upload_capped_torrent();
+        torrent.upload_totals.insert(1, 9 * GIB);
+
+        let recorded = torrent.record_upload(1, PeerId([1; 20]), 3 * GIB, 100);
+
+        assert_eq!(recorded.creditable_delta, GIB);
+        assert_eq!(torrent.upload_totals.get(&1), Some(&(12 * GIB)));
+    }
+
+    /// Crossing, boundary: an announce that lands exactly on the cap is
+    /// credited in full and caps the user; the next byte isn't credited.
+    #[test]
+    fn record_upload_credits_announce_reaching_cap_exactly() {
+        let mut torrent = upload_capped_torrent();
+        torrent.upload_totals.insert(1, 9 * GIB);
+
+        let reaching = torrent.record_upload(1, PeerId([1; 20]), GIB, 100);
+        let past = torrent.record_upload(1, PeerId([1; 20]), 1, 100);
+
+        assert_eq!(
+            reaching,
+            RecordedUpload {
+                is_upload_capped: true,
+                creditable_delta: GIB,
+            },
+            "reaching the cap exactly must credit the whole announce"
+        );
+        assert_eq!(
+            past.creditable_delta, 0,
+            "the first byte past the cap must not be credited"
+        );
+    }
+
+    /// Flag off and on again, as `api::torrent::upsert` applies it: turning
+    /// the flag off drops the totals and credits everything again; turning it
+    /// back on with the totals reloaded from `history` stops credit again.
+    #[test]
+    fn record_upload_follows_upload_cap_being_switched_off_and_on() {
+        let mut torrent = upload_capped_torrent();
+        torrent.upload_totals.insert(1, 12 * GIB);
+        assert_eq!(
+            torrent
+                .record_upload(1, PeerId([1; 20]), GIB, 100)
+                .creditable_delta,
+            0,
+            "the user starts out capped"
+        );
+
+        torrent.upload_cap = false;
+        torrent.upload_totals = UploadTotalStore::new();
+        let while_off = torrent.record_upload(1, PeerId([1; 20]), 2 * GIB, 100);
+
+        assert_eq!(
+            while_off.creditable_delta,
+            2 * GIB,
+            "everything must be credited after the flag is switched off"
+        );
+
+        // `history.actual_uploaded` now holds 12 + 1 + 2 GiB
+        torrent.upload_cap = true;
+        torrent.upload_totals.insert(1, 15 * GIB);
+        let on_again = torrent.record_upload(1, PeerId([1; 20]), GIB, 100);
+
+        assert_eq!(
+            on_again.creditable_delta, 0,
+            "switching the flag back on must stop credit again"
         );
     }
 }
