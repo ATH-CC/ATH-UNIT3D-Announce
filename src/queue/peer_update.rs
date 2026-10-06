@@ -28,7 +28,9 @@ pub struct PeerUpdate {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub connectable: bool,
+    // Start: Upload cap
     pub is_upload_capped: bool,
+    // End: Upload cap
 }
 
 impl Mergeable for PeerUpdate {
@@ -45,7 +47,9 @@ impl Mergeable for PeerUpdate {
             self.left = new.left;
             self.updated_at = new.updated_at;
             self.connectable = new.connectable;
+            // Start: Upload cap
             self.is_upload_capped = new.is_upload_capped;
+            // End: Upload cap
         }
 
         self.created_at = std::cmp::min(self.created_at, new.created_at);
@@ -104,7 +108,9 @@ impl Flushable<PeerUpdate> for super::Batch<Index, PeerUpdate> {
                     .push_bind(index.torrent_id)
                     .push_bind(index.user_id)
                     .push_bind(peer_update.connectable)
+                    // Start: Upload cap
                     .push_bind(peer_update.is_upload_capped);
+                // End: Upload cap
             })
             // Mysql 8.0.20 deprecates use of VALUES() so will have to update it eventually to use aliases instead
             // However, Mariadb doesn't yet support aliases
@@ -135,6 +141,7 @@ impl Flushable<PeerUpdate> for super::Batch<Index, PeerUpdate> {
     }
 }
 
+// Start: Upload cap
 #[cfg(test)]
 mod tests {
     //! Tests that the `upload_capped` column written to the peers table
@@ -194,3 +201,4 @@ mod tests {
         );
     }
 }
+// End: Upload cap

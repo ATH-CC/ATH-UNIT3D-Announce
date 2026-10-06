@@ -4,14 +4,18 @@ use std::sync::Arc;
 use axum::extract::{Json, Path, State};
 use axum::http::StatusCode;
 use serde::Deserialize;
+// Start: Upload cap
 use tracing::{error, info};
+// End: Upload cap
 
 use anyhow::Result;
 
 use crate::model::{info_hash::InfoHash, torrent_status::TorrentStatus};
 use crate::state::AppState;
 use crate::store::torrent::Torrent;
+// Start: Upload cap
 use crate::store::upload_total::UploadTotalStore;
+// End: Upload cap
 
 #[derive(Clone, Deserialize)]
 pub struct APIInsertTorrent {
@@ -24,13 +28,16 @@ pub struct APIInsertTorrent {
     pub times_completed: u32,
     pub download_factor: u8,
     pub upload_factor: u8,
+    // Start: Upload cap
     // Defaults keep older UNIT3D versions that don't send these working.
     #[serde(default)]
     pub size: u64,
     #[serde(default)]
     pub upload_cap: bool,
+    // End: Upload cap
 }
 
+// Start: Upload cap
 /// Whether upload totals must be loaded from `history`: the upload cap is on
 /// now and wasn't on the torrent already in the store.
 fn needs_upload_totals_load(upload_cap: bool, old_torrent: Option<&Torrent>) -> bool {
@@ -50,6 +57,7 @@ fn select_upload_totals(
         UploadTotalStore::new()
     }
 }
+// End: Upload cap
 
 pub async fn upsert(
     State(state): State<Arc<AppState>>,
@@ -58,6 +66,7 @@ pub async fn upsert(
     if let Ok(info_hash) = InfoHash::from_str(&torrent.info_hash) {
         info!("Inserting torrent with id {}.", torrent.id);
 
+        // Start: Upload cap
         // Upload totals are only kept in memory while upload cap is
         // enabled, so they don't exist yet when it gets switched on and have
         // to be loaded from `history`.
@@ -101,7 +110,9 @@ pub async fn upsert(
         } else {
             None
         };
+        // End: Upload cap
 
+        // Start: Upload cap
         let threshold_percent = state.config.load().upload_cap_threshold;
 
         {
@@ -117,6 +128,7 @@ pub async fn upsert(
             );
 
             let mut new_torrent = Torrent {
+                // End: Upload cap
                 id: torrent.id,
                 status: torrent.status,
                 is_deleted: torrent.is_deleted,
@@ -125,12 +137,15 @@ pub async fn upsert(
                 times_completed: torrent.times_completed,
                 download_factor: torrent.download_factor,
                 upload_factor: torrent.upload_factor,
+                // Start: Upload cap
                 size: torrent.size,
                 upload_cap: torrent.upload_cap,
                 upload_totals,
                 peers: old_torrent.peers,
+                // End: Upload cap
             };
 
+            // Start: Upload cap
             // Cached flags may be stale after loading totals or a size or
             // threshold change. They are ignored while the upload cap is off.
             if new_torrent.upload_cap {
@@ -138,6 +153,7 @@ pub async fn upsert(
             }
 
             torrents.insert(torrent.id, new_torrent);
+            // End: Upload cap
         }
 
         state
@@ -186,6 +202,7 @@ pub async fn show(
         .ok_or(StatusCode::NOT_FOUND)
 }
 
+// Start: Upload cap
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,4 +251,16 @@ mod tests {
         ));
         assert!(select_upload_totals(false, totals(1, 7), None).is_empty());
     }
+
+    /// Negative side of loading totals: a torrent that is added or updated
+    /// without upload cap must not query `history` at all.
+    #[test]
+    fn does_not_load_totals_without_upload_cap() {
+        assert!(!needs_upload_totals_load(false, None));
+        assert!(!needs_upload_totals_load(
+            false,
+            Some(&torrent_with_upload_cap(false))
+        ));
+    }
 }
+// End: Upload cap

@@ -51,6 +51,9 @@ use crate::store::{
     freeleech_token::FreeleechToken,
     peer::{self, Peer},
     personal_freeleech::PersonalFreeleech,
+    // Start: Upload cap
+    torrent::RecordedUpload,
+    // End: Upload cap
 };
 use crate::utils;
 
@@ -378,13 +381,18 @@ pub async fn announce(
         upload_factor,
         download_factor,
         uploaded_delta,
+        // Start: Upload cap
+        creditable_uploaded_delta,
+        // End: Upload cap
         downloaded_delta,
         seeder_delta,
         leecher_delta,
         times_completed_delta,
         is_visible,
         is_active_after_stop,
+        // Start: Upload cap
         is_upload_capped,
+        // End: Upload cap
         user,
         user_id,
         group,
@@ -528,7 +536,9 @@ pub async fn announce(
                     updated_at: now,
                     uploaded: queries.uploaded,
                     downloaded: queries.downloaded,
+                    // Start: Upload cap
                     is_upload_capped: false,
+                    // End: Upload cap
                 });
 
             is_visible = new_peer.is_visible;
@@ -610,6 +620,7 @@ pub async fn announce(
             }
         }
 
+        // Start: Upload cap
         // Track the user's total upload and refresh the cached cap flag.
         // The result is written to `peers.upload_capped` for the UI. The
         // user's other clients are only written on their own next announce.
@@ -617,12 +628,21 @@ pub async fn announce(
         // It also decides below whether this peer may be sent leeches.
         // Recording the upload first means a peer that crosses the threshold
         // with this announce already gets no leeches in this response.
-        let is_upload_capped = torrent.record_upload(
+        //
+        // Upload past the cap is still recorded in full (`actual_uploaded`,
+        // `client_uploaded` and the torrent balance), but only the creditable
+        // part counts towards the credited upload in `history.uploaded` and
+        // `users.uploaded`.
+        let RecordedUpload {
+            is_upload_capped,
+            creditable_delta: creditable_uploaded_delta,
+        } = torrent.record_upload(
             user_id,
             queries.peer_id,
             uploaded_delta,
             config.upload_cap_threshold,
         );
+        // End: Upload cap
 
         // Has to be adjusted before the peer list is generated
         torrent.seeders = torrent.seeders.saturating_add_signed(seeder_delta);
@@ -656,6 +676,7 @@ pub async fn announce(
                 index.user_id != user_id && peer.is_included_in_peer_list(&config)
             });
 
+            // Start: Upload cap
             // Withhold peers of users who uploaded too much on this torrent
             let withholds_capped_peers = torrent.upload_cap && config.upload_cap_threshold != 0;
 
@@ -674,12 +695,14 @@ pub async fn announce(
                 withholds_capped_peers,
                 is_upload_capped,
             );
+            // End: Upload cap
 
             // Make sure leech peer lists are filled with seeds
             if queries.left > 0 && torrent.seeders > 0 && queries.numwant > peers.len() {
                 has_requested_seed_list = true;
 
                 if user.receive_seed_list_rates.is_under_limit() {
+                    // Start: Upload cap
                     // If every seed is withheld, send them anyway so the
                     // leech isn't left without a source.
                     peers.extend(choose_peers(
@@ -688,11 +711,13 @@ pub async fn announce(
                         withholds_capped_peers,
                         queries.numwant,
                     ));
+                    // End: Upload cap
                 } else {
                     is_over_seed_list_rate_limit = true;
                 }
             }
 
+            // Start: Upload cap
             // Otherwise only send leeches until the numwant is reached.
             //
             // Capped peers get no leeches at all. The list then doesn't count
@@ -702,15 +727,18 @@ pub async fn announce(
                 && torrent.leechers > 0
                 && queries.numwant > peers.len()
             {
+                // End: Upload cap
                 has_requested_leech_list = true;
 
                 if user.receive_leech_list_rates.is_under_limit() {
+                    // Start: Upload cap
                     peers.extend(choose_peers(
                         valid_peers,
                         PeerKind::Leech,
                         withholds_capped_peers,
                         queries.numwant.saturating_sub(peers.len()),
                     ));
+                    // End: Upload cap
                 } else {
                     is_over_leech_list_rate_limit = true;
                 }
@@ -837,13 +865,18 @@ pub async fn announce(
             upload_factor,
             download_factor,
             uploaded_delta,
+            // Start: Upload cap
+            creditable_uploaded_delta,
+            // End: Upload cap
             downloaded_delta,
             seeder_delta,
             leecher_delta,
             times_completed_delta,
             is_visible,
             is_active_after_stop,
+            // Start: Upload cap
             is_upload_capped,
+            // End: Upload cap
             user,
             user_id,
             group,
@@ -888,8 +921,12 @@ pub async fn announce(
         upload_factor
     };
 
-    let credited_uploaded_delta = upload_factor as u64 * uploaded_delta / 100;
-    let credited_downloaded_delta = download_factor as u64 * downloaded_delta / 100;
+    // Start: Upload cap
+    // Factors are applied after the upload cap, so double upload doubles the
+    // allowance left below the cap but never credits upload past it.
+    let credited_uploaded_delta = apply_factor(creditable_uploaded_delta, upload_factor);
+    let credited_downloaded_delta = apply_factor(downloaded_delta, download_factor);
+    // End: Upload cap
 
     let completed_at = if queries.event == Event::Completed {
         Some(now)
@@ -940,7 +977,9 @@ pub async fn announce(
             created_at: now,
             updated_at: now,
             connectable: is_connectable,
+            // Start: Upload cap
             is_upload_capped,
+            // End: Upload cap
         },
     );
 
@@ -1071,12 +1110,25 @@ async fn check_connectivity(state: &Arc<AppState>, ip: IpAddr, port: u16) -> boo
     false
 }
 
+// Start: Upload cap
+/// Scales a raw byte delta by a percentage factor, e.g. 200 for double
+/// upload or 0 for freeleech, rounding down.
+///
+/// Computed in `u128` and saturated, so an absurd client-reported delta
+/// can't overflow (a panic in debug builds, a wrap in release builds).
+#[inline]
+fn apply_factor(delta: u64, factor_percent: u8) -> u64 {
+    u64::try_from(delta as u128 * factor_percent as u128 / 100).unwrap_or(u64::MAX)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PeerKind {
     Seed,
     Leech,
 }
+// End: Upload cap
 
+// Start: Upload cap
 /// Randomly chooses up to `amount` peers of `kind`, leaving out peers of
 /// capped users when `withholds_capped_peers` is set. Seed lists fall back
 /// to capped seeds if no other seed is available.
@@ -1103,7 +1155,9 @@ fn choose_peers<'a>(
 
     chosen
 }
+// End: Upload cap
 
+// Start: Upload cap
 /// Whether the announcing peer may be sent leeches in its peer list.
 ///
 /// The tracker only controls who learns which addresses. It can't control
@@ -1153,7 +1207,9 @@ fn receives_leech_list<'a>(
     // clients of one user share the same cap state.
     !peers.any(|(_, peer)| peer.is_seeder && !peer.is_upload_capped)
 }
+// End: Upload cap
 
+// Start: Upload cap
 #[cfg(test)]
 mod tests {
     //! Tests for `choose_peers`, which builds the seed and leech parts of
@@ -1450,4 +1506,63 @@ mod tests {
             "a capped seed in an empty swarm must not be blocked"
         );
     }
+
+    // Tests for `apply_factor` and how it composes with the upload cap.
+
+    /// Factors are percentages: 100 is unchanged, 200 doubles, 0 drops the
+    /// delta (freeleech), 50 halves it rounding down.
+    #[test]
+    fn apply_factor_scales_by_percentage() {
+        assert_eq!(apply_factor(1_000, 100), 1_000);
+        assert_eq!(apply_factor(1_000, 200), 2_000);
+        assert_eq!(apply_factor(1_000, 0), 0);
+        assert_eq!(apply_factor(3, 50), 1);
+    }
+
+    /// A delta near `u64::MAX` must saturate instead of overflowing.
+    #[test]
+    fn apply_factor_saturates() {
+        assert_eq!(apply_factor(u64::MAX, 200), u64::MAX);
+        assert_eq!(apply_factor(u64::MAX, 100), u64::MAX);
+    }
+
+    /// The crossing announce on a double upload torrent: 2 bytes were left
+    /// below the cap, so 4 bytes are credited, not twice the full delta.
+    #[test]
+    fn upload_factor_applies_to_creditable_part_only() {
+        use crate::store::upload_total::creditable_upload;
+
+        let creditable = creditable_upload(98, 10, 100, 100);
+
+        assert_eq!(creditable, 2);
+        assert_eq!(apply_factor(creditable, 200), 4);
+    }
+
+    /// The example from the feature description: 9 GiB uploaded, 3 GiB
+    /// announced on a 10 GiB double upload torrent. Only the 1 GiB below the
+    /// cap is doubled, so 2 GiB are credited, not 6 GiB.
+    #[test]
+    fn upload_factor_doubles_only_the_part_below_the_cap() {
+        use crate::store::upload_total::creditable_upload;
+
+        const GIB: u64 = 1 << 30;
+
+        let creditable = creditable_upload(9 * GIB, 3 * GIB, 10 * GIB, 100);
+
+        assert_eq!(apply_factor(creditable, 200), 2 * GIB);
+    }
+
+    /// Negative side: below the cap, double upload doubles the whole
+    /// announce, exactly as without upload cap.
+    #[test]
+    fn upload_factor_doubles_everything_below_the_cap() {
+        use crate::store::upload_total::creditable_upload;
+
+        const GIB: u64 = 1 << 30;
+
+        let creditable = creditable_upload(GIB, 3 * GIB, 10 * GIB, 100);
+
+        assert_eq!(apply_factor(creditable, 200), 6 * GIB);
+    }
 }
+// End: Upload cap
