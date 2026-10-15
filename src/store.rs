@@ -9,6 +9,9 @@ pub mod passkey2id;
 pub mod peer;
 pub mod personal_freeleech;
 pub mod torrent;
+// Start: Upload cap
+pub mod upload_total;
+// End: Upload cap
 pub mod user;
 
 use sqlx::{MySql, MySqlPool, QueryBuilder};
@@ -64,7 +67,9 @@ impl Stores {
 
         print!("Starting to load  3/11: torrents                       ... ");
         io::stdout().flush().unwrap();
-        let torrents = TorrentStore::from_db(&pool).await?;
+        // Start: Upload cap
+        let torrents = TorrentStore::from_db(&pool, config.upload_cap_threshold).await?;
+        // End: Upload cap
         println!("[Finished] Records: {:?}", torrents.len());
 
         print!("Starting to load  4/11: infohash to torrent id mappings... ");
